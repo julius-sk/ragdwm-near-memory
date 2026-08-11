@@ -1,0 +1,25 @@
+# 构建产物
+build/
+*.mubin
+*.o
+*.so
+__pycache__/
+*.pyc
+
+# XCENA SDK(1.4 GB,从官方渠道获取,不入库)
+xcena_sdk/
+
+# 大文件与打包产物
+*.tar.gz
+*.tar.xz
+h1_bundle.tar.gz
+
+# 本地测试数据(签名库可达 GB 级)
+*.bin
+*.i32
+*.ids
+*.npy
+
+# 编辑器
+.vscode/
+.idea/
