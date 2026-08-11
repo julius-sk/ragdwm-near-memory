@@ -22,6 +22,23 @@
 - **正确性优先**:任何性能数字之前,设备结果必须与 numpy 参考**逐位一致**。DRAN 项目中手写标量循环曾在同一工具链 -O3 下产生错误结果,故两种 popcount 实现都必须先验证。
 - **不改动 `dran_mu/` 下任何文件。**
 
+## 执行环境划分(重要)
+
+**开发机(本地)没有 XCENA 硬件,也没有任何 C++ 编译器**(g++/clang/cmake/ninja 均无),
+只有 Python 3 + numpy 2.4.6(`bitwise_count` 可用)。因此每一步都标注了执行位置:
+
+| 标记 | 含义 | 谁执行 |
+|---|---|---|
+| **[本地]** | 写代码、跑 Python 测试 | subagent 直接做,并验证 |
+| **[服务器]** | 需要编译或 XCENA 硬件 | **subagent 不执行**,写进 `hamming_mu/RUNBOOK.md` 交给人去跑 |
+
+**subagent 规则:遇到 [服务器] 步骤,不要尝试执行,也不要伪造结果。**
+把命令与预期输出追加进 `hamming_mu/RUNBOOK.md`,标记该步为"待服务器验证",然后继续下一步。
+
+**风险控制**:C++ 无法本地编译,但 kernel 的**算法**(257 桶直方图 → 精确阈值 →
+候选收集 → 溢出重试)是纯逻辑,Task 2b 用 Python 精确建模并对 numpy 模糊测试。
+算法在本地验对之后,服务器上只剩环境与性能问题,不必再调算法。
+
 ---
 
 ### Task 1: 环境校验与目录骨架
@@ -509,6 +526,201 @@ Expected: `self-test: ALL PASS`;输出 `wrote 10000 sigs -> /tmp/sig10k.bin (320
 cd "$HOME/engramme"
 git add hamming_mu/verify_host.py
 git commit -m "feat(hamming): numpy reference + data generator with self-tests"
+```
+
+---
+
+### Task 2b: kernel 算法的 Python 模型与模糊测试 [本地]
+
+**Files:**
+- Create: `hamming_mu/model_kernel.py`
+
+**Interfaces:**
+- Consumes: Task 2 的 `gen_sigs` / `hamming_all` / `topk_ids`
+- Produces:
+  - `scan_hist(sigs, query, task_count, coarse_thresh, cand_cap) -> (hist, cand, meta)`
+    —— 精确模拟 `hamming_scan_hist`,`hist` 形状 `(task_count, 257)`,
+    `cand` 形状 `(task_count, cand_cap)`,`meta` 形状 `(task_count, 2)` = [candCount, overflow]
+  - `merge_topk(hist, cand, meta, top_k) -> (ids, exact_thresh, any_overflow, collected)`
+    —— 精确模拟 `hamming_merge_topk`
+  - `run_with_retry(sigs, query, task_count, top_k, cand_cap, thresh0) -> (ids, n_attempts)`
+    —— 精确模拟 host 端的溢出重试循环
+
+**为什么需要这个任务:** C++ 无法本地编译,但上述三段是整个计划里唯一
+"想错了会静默出错"的逻辑。用 Python 逐行对应地实现一遍并模糊测试,
+可以在不碰硬件的前提下证明算法本身正确。**这不是替代设备测试,
+而是把算法 bug 与环境 bug 分离**,避免在服务器上同时调两件事。
+
+- [ ] **Step 1: 写失败的测试 [本地]**
+
+创建 `hamming_mu/model_kernel.py`:
+
+```python
+"""kernel 算法的 Python 模型 —— 与 mu_hamming.cpp 逐行对应。
+
+用途:本地(无 XCENA、无 C++ 编译器)验证计数排序 top-k 与溢出重试的正确性。
+模型改了,C++ 也要改;两边逻辑必须保持一致。
+"""
+import numpy as np
+
+from verify_host import BITS, NBUCKETS, WORDS, gen_sigs, hamming_all, topk_ids
+
+
+def _task_range(num_sigs, task_idx, task_count):
+    """与 kernel 的 myRange 逐行对应:均分,最后一个吃余数。"""
+    per_task = (num_sigs + task_count - 1) // task_count
+    begin = task_idx * per_task
+    end = min(begin + per_task, num_sigs)
+    return min(begin, num_sigs), end
+
+
+def _fuzz():
+    rng = np.random.default_rng(7)
+    for trial in range(200):
+        n = int(rng.integers(1, 3000))
+        tc = int(rng.integers(1, 65))
+        k = int(rng.integers(1, min(n, 200) + 1))
+        cap = int(rng.integers(1, 300))
+        thresh = int(rng.integers(0, BITS + 1))
+
+        sigs = gen_sigs(n, seed=trial)
+        query = gen_sigs(1, seed=trial + 9999)[0]
+        ref = hamming_all(sigs, query)
+
+        ids, attempts = run_with_retry(sigs, query, tc, k, cap, thresh)
+
+        # 不变式 1:凑够 k 个(除非 cap*tc 物理上装不下 k 个)
+        if cap * tc >= k:
+            assert len(ids) == k, f"trial {trial}: 只收到 {len(ids)}/{k}"
+            # 不变式 2:每个返回 id 的距离必须 <= 第 k 名的距离(平局允许换人)
+            kth = np.sort(ref)[k - 1]
+            assert ref[ids].max() <= kth, (
+                f"trial {trial}: 返回距离 {ref[ids].max()} > 第k名 {kth}")
+            # 不变式 3:无重复 id
+            assert len(set(ids.tolist())) == len(ids), f"trial {trial}: 有重复 id"
+        # 不变式 4:重试次数有界
+        assert attempts <= 5, f"trial {trial}: 重试 {attempts} 次未收敛"
+
+    # 定向用例:阈值极紧(收集不足)与极松(必然溢出)都要能自愈
+    sigs = gen_sigs(2000, seed=1)
+    query = gen_sigs(1, seed=2)[0]
+    ref = hamming_all(sigs, query)
+    for thresh0 in (0, BITS):
+        ids, attempts = run_with_retry(sigs, query, 4, 50, 60, thresh0)
+        kth = np.sort(ref)[49]
+        assert len(ids) == 50 and ref[ids].max() <= kth, f"thresh0={thresh0} 未自愈"
+        assert attempts >= 1, f"thresh0={thresh0} 应触发至少一次重试"
+
+    # 直方图必须统计全部签名,不受 cand_cap 影响(溢出自愈的前提)
+    hist, _cand, _meta = scan_hist(sigs, query, 4, coarse_thresh=BITS, cand_cap=1)
+    assert hist.sum() == len(sigs), "直方图丢了签名 —— 溢出自愈的前提被破坏"
+
+    print("model fuzz: ALL PASS (200 随机 + 定向用例)")
+
+
+if __name__ == "__main__":
+    _fuzz()
+```
+
+- [ ] **Step 2: 运行测试,确认失败 [本地]**
+
+Run: `cd hamming_mu && python model_kernel.py`
+
+Expected: FAIL —— `NameError: name 'run_with_retry' is not defined`
+
+- [ ] **Step 3: 写模型实现 [本地]**
+
+在 `model_kernel.py` 中,把下列函数插入到 `_fuzz` **之前**:
+
+```python
+def scan_hist(sigs, query, task_count, coarse_thresh, cand_cap):
+    """模拟 hamming_scan_hist:每 task 一份 257 桶直方图 + 候选分片。"""
+    n = len(sigs)
+    dists = hamming_all(sigs, query)
+    hist = np.zeros((task_count, NBUCKETS), dtype=np.uint32)
+    cand = np.zeros((task_count, cand_cap), dtype=np.uint32)
+    meta = np.zeros((task_count, 2), dtype=np.uint32)   # [candCount, overflow]
+
+    for t in range(task_count):
+        begin, end = _task_range(n, t, task_count)
+        n_cand = 0
+        overflow = 0
+        for i in range(begin, end):
+            d = int(dists[i])
+            hist[t, d] += 1                      # 直方图统计全部,不受 cap 影响
+            if d <= coarse_thresh:
+                if n_cand < cand_cap:
+                    cand[t, n_cand] = i
+                    n_cand += 1
+                else:
+                    overflow = 1                 # 记录但不中断
+        meta[t, 0] = n_cand
+        meta[t, 1] = overflow
+    return hist, cand, meta
+
+
+def merge_topk(hist, cand, meta, top_k):
+    """模拟 hamming_merge_topk:归并直方图定精确阈值,收集候选。"""
+    task_count = hist.shape[0]
+    total = hist.sum(axis=0, dtype=np.uint64)
+
+    exact_thresh = BITS
+    cum = 0
+    for b in range(NBUCKETS):
+        cum += int(total[b])
+        if cum >= top_k:
+            exact_thresh = b
+            break
+
+    any_overflow = int(meta[:, 1].any())
+
+    ids = []
+    for t in range(task_count):
+        if len(ids) >= top_k:
+            break
+        cnt = int(meta[t, 0])
+        for j in range(cnt):
+            if len(ids) >= top_k:
+                break
+            ids.append(int(cand[t, j]))
+
+    collected = len(ids)
+    return np.array(ids, dtype=np.uint32), exact_thresh, any_overflow, collected
+
+
+def run_with_retry(sigs, query, task_count, top_k, cand_cap, thresh0, max_attempts=5):
+    """模拟 host 端的溢出/收集不足重试循环。"""
+    thresh = thresh0
+    attempts = 0
+    ids = np.array([], dtype=np.uint32)
+    for _ in range(max_attempts):
+        hist, cand, meta = scan_hist(sigs, query, task_count, thresh, cand_cap)
+        ids, exact_thresh, any_overflow, collected = merge_topk(hist, cand, meta, top_k)
+        if not any_overflow and collected >= top_k:
+            break
+        # 两种情况都收敛到 kernel 算出的精确阈值
+        if thresh == exact_thresh:
+            break                                 # 已在精确阈值,再重试无意义
+        thresh = exact_thresh
+        attempts += 1
+    return ids, attempts
+```
+
+- [ ] **Step 4: 运行测试,确认通过 [本地]**
+
+Run: `cd hamming_mu && python model_kernel.py`
+
+Expected: `model fuzz: ALL PASS (200 随机 + 定向用例)`
+
+若某条不变式失败,说明**算法本身**有问题,必须先修模型再同步改 C++ —— 
+这正是本任务的目的:在没有硬件的情况下抓出算法 bug。
+
+- [ ] **Step 5: 提交 [本地]**
+
+```bash
+cd "$HOME/engramme"
+git add hamming_mu/model_kernel.py
+git commit -m "test(hamming): python model of kernel algorithm, fuzzed vs numpy"
 ```
 
 ---
@@ -1691,6 +1903,124 @@ cd hamming_mu && sed -i '/-DPOPCNT_SWAR/d' mu_kernel/CMakeLists.txt && ./build.s
 cd "$HOME/engramme"
 git add hamming_mu/bench_host_baseline.py hamming_mu/RESULTS.md
 git commit -m "bench(hamming): host baseline + three-way comparison results"
+```
+
+---
+
+### Task 9: 汇总服务器 RUNBOOK [本地]
+
+**Files:**
+- Create/Modify: `hamming_mu/RUNBOOK.md`
+- Create: `hamming_mu/transfer.sh`
+
+**Interfaces:**
+- Consumes: Task 1~8 中所有标记 [服务器] 的步骤
+- Produces: 一份可从上到下照着执行的服务器操作手册
+
+**背景:** 开发机无 XCENA 硬件也无 C++ 编译器,所有编译与测量都要在
+另一台服务器上进行。本任务把散落在各任务中的服务器步骤汇总成一份连贯手册,
+使执行者不必回头翻计划。
+
+- [ ] **Step 1: 写传输脚本 [本地]**
+
+创建 `hamming_mu/transfer.sh`:
+
+```bash
+#!/bin/bash
+# 把源码同步到有 XCENA 的服务器。只传源码,不传数据与构建产物。
+# 用法: ./transfer.sh user@server:/path/to/dest
+set -eu
+DEST="${1:?用法: ./transfer.sh user@server:/path/to/dest}"
+
+rsync -av --progress \
+  --exclude 'build/' \
+  --exclude '*.mubin' \
+  --exclude '*.bin' --exclude '*.i32' --exclude '*.ids' --exclude '*.npy' \
+  --exclude '__pycache__/' \
+  ./ "${DEST}/hamming_mu/"
+
+echo
+echo "同步完成。在服务器上执行:"
+echo "  cd ${DEST##*:}/hamming_mu && bash env_check.sh"
+```
+
+- [ ] **Step 2: 汇总 RUNBOOK [本地]**
+
+创建(或补全)`hamming_mu/RUNBOOK.md`,内容为按顺序排列的服务器操作,
+每节须包含:**命令、预期输出、失败时怎么办**。骨架如下,
+把各任务中标记 [服务器] 的步骤逐条填入:
+
+```markdown
+# 服务器操作手册 —— MX1P Hamming 扫描
+
+开发机无 XCENA 硬件与 C++ 工具链,以下全部在装有 MX1P 的服务器上执行。
+算法已在开发机用 `model_kernel.py` 模糊测试通过,故此处出的问题
+优先怀疑**环境**与**性能**,而非算法。
+
+## 0. 同步源码
+
+    ./transfer.sh user@server:/home/you/work
+
+## 1. 环境校验(不过不要继续)
+
+    cd hamming_mu && bash env_check.sh
+
+预期:PCI 设备存在;dkms 有匹配当前内核的 mx_dma;daxctl 显示 devdax;
+computable=Yes;validate_host.sh 无 FAIL。
+
+失败处理:
+- mode 是 system-ram → `sudo daxctl reconfigure-device --mode=devdax --force dax0.0`
+- dkms 无条目 → 换过内核,需重建 mx_dma
+- computable=No → 固件不在 Computing 模式
+
+## 2. 编译
+
+    ./build.sh
+
+预期:产出 `mu_kernel/mu_kernel.mubin` 与可执行 `hamming_scan`。
+失败处理:`half_float 未声明` → 本项目为纯整数路径,不应 include half.hpp。
+
+## 3. 看反汇编,确认 popcount 是否用上硬件指令
+
+(填入 Task 3 Step 3 的命令与判读方法)
+
+## 4. 正确性验证(性能之前必须过)
+
+(填入 Task 4 Step 3 的 B 组逐位比对、Task 7 Step 3/4 的 C 组 top-k 与溢出验证)
+
+**若结果错 + 每次运行不同 + 主机自查正常 → 三条同时出现就是 flushHostCache 问题,
+先查 flush,不要怀疑算法。**
+
+## 5. 扫 batchSize / numSub(建立真实基线,不可后移)
+
+(填入 Task 5 的命令;强调默认 batchSize=16 只激活 1/16 的核)
+
+## 6. 三组对比测量
+
+(填入 Task 8 Step 2/3 的 A/B/C 三组命令)
+
+## 7. popcount 双实现对比
+
+(填入 Task 8 Step 4 的命令,含 SWAR 版必须重新验证正确性)
+
+## 8. 把结果填回 RESULTS.md 并传回开发机
+```
+
+- [ ] **Step 3: 自查 RUNBOOK 完整性 [本地]**
+
+逐条核对:Task 1 Step 2/6、Task 3 Step 2/3、Task 4 Step 2/3、Task 5 全部、
+Task 7 Step 2/3/4、Task 8 Step 2/3/4 —— 这些 [服务器] 步骤是否都已进入 RUNBOOK。
+
+Run: `grep -c '^##' hamming_mu/RUNBOOK.md`
+
+Expected: ≥ 9 个小节(0~8)。
+
+- [ ] **Step 4: 提交 [本地]**
+
+```bash
+cd "$HOME/engramme"
+git add hamming_mu/RUNBOOK.md hamming_mu/transfer.sh
+git commit -m "docs(hamming): server runbook and transfer script"
 ```
 
 ---
