@@ -9,7 +9,15 @@ from verify_host import BITS, NBUCKETS, WORDS, gen_sigs, hamming_all, topk_ids
 
 
 def _task_range(num_sigs, task_idx, task_count):
-    """与 kernel 的 myRange 逐行对应:均分,最后一个吃余数。"""
+    """与 kernel 的 myRange 逐行对应。
+
+    分块规则是 **ceil 分块**:每 task 取 ceil(n/taskCount) 个,末尾的 task
+    分到的**更少、甚至为空**(不是"最后一个吃掉余数")。两种约定给出不同划分,
+    例如 n=10, taskCount=4:
+        ceil 分块      -> [0,3) [3,6) [6,9) [9,10)
+        余数给最后一个 -> [0,2) [2,4) [4,6) [6,10)
+    C++ 侧的 myRange 必须用同一条规则,否则模型与设备会静默分歧。
+    """
     per_task = (num_sigs + task_count - 1) // task_count
     begin = task_idx * per_task
     end = min(begin + per_task, num_sigs)
