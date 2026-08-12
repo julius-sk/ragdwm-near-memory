@@ -27,8 +27,8 @@
 
 | 组 | 做法 | 链路流量/查询 |
 |---|---|---|
-| **A** host-only | numba 融合 popcount,数据在主机 | 整库需入主机 |
-| **B** 设备扫描 + host 选 | 设备算距离,回传 N 个距离,host 选 top-k | query 32B + N×2B |
+| **A** host-only | numpy `bitwise_count` 融合 popcount,数据在主机 | 整库需入主机 |
+| **B** 设备扫描 + host 选 | 设备算距离,回传 N 个距离,host 选 top-k | query 32B + N×4B |
 | **C** 设备扫描 + 设备选 | 设备算距离 + 计数排序 top-k,只回 k 个 id | query 32B + k×4B ≈ 2 KB |
 
 - **A ↔ C** = 近内存的价值
@@ -69,7 +69,8 @@ N=100M 时 arena 约 4 GB,**整体 preload 一次**。
 每 task 扫一段连续签名。每个签名做 4 次 XOR + popcount 累加 → 距离 ∈ [0, 256]。然后:
 
 1. 累加到该 task 私有的 **257 桶直方图**(距离是有界整数 → O(N) 计数排序的基础)
-2. 将 `dist ≤ 粗阈值` 的候选 `(id, dist)` 写入该 task 的候选分片
+2. 将 `dist ≤ 粗阈值` 的候选**连同它的距离**写入该 task 的候选分片:
+   交错存放 `cand[2j] = id`、`cand[2j+1] = dist`
 3. 维护该 task 的 `candCount` 与 `overflow` 标志
 
 每 task 只写自己的分片 → **天然无竞争**(playbook §4:Map 内无跨 task 同步)。
@@ -79,20 +80,50 @@ B 组变体:跳过 1/2/3,直接把 dist 写进全局 dist 数组。
 ### kernel 2 `merge_topk` — taskCount = 1
 
 1. 归并所有 task 的 257 桶直方图
-2. 从距离 0 往上累加,定位第 k 名所在桶 → **精确距离阈值**
-3. 扫候选分片,收集 k 个 id 写入输出
+2. 从距离 0 往上累加,定位第 k 名所在桶 → **精确距离阈值 `exactThresh`**
+3. 扫候选分片,**只收 `dist ≤ exactThresh` 的候选**,取满 k 个写入输出
 
 **为什么必须两个 kernel**:归并需看到所有 task 的直方图,而 Map 内无同步。
 playbook §4 明确要求"每 task 写分片 + 再启 taskCount=1 的 kernel 归并"。
 
-### 候选溢出处理(正确性硬边界)
+### ★ 为什么候选必须带上距离(一个已复现的静默错误)
 
-粗阈值定松时候选数可能超出分片容量,直接丢结果 → 静默错误。
+**初版设计里候选只存 id,merge 按索引顺序取前 k 个 —— 这是错的,而且是静默的。**
+候选只满足 `d ≤ coarseThresh`;当 `coarseThresh > exactThresh` 时,
+按索引序取前 k 个会取到粗阈值宽带里的任意 id,而不是最近的那些。
 
-**方案**:每 task 记录 `candCount` 与 `overflow`。kernel 2 检测到任一 task
-溢出时,用直方图算出的**精确阈值**回退重扫一遍(或主机侧读到 overflow 后
-以更紧阈值重跑)。直方图本身**不受溢出影响**(它统计全部签名),
-所以精确阈值始终可算 —— 这是该方案能自我修复的原因。
+实测复现(n=2000, k=50, taskCount=4, coarse=148, cap 足够大):
+
+```
+overflow=0  collected=50  ->  成功门通过
+exactThresh=113 = 真实第k名距离
+但返回 id 的最大距离 = 145   ✗ 错误
+```
+
+**成功门通过、结果却是错的** —— 正是本项目最警惕的静默失败。
+根因:候选缓冲不存距离,merge 物理上无法按 `exactThresh` 过滤。
+
+**修法(Option B):候选带上距离,merge 真的按 `exactThresh` 过滤。**
+由此得到一条关键性质:
+
+> 过滤后每个返回 id 都满足 `d ≤ exactThresh = 第k名距离`,
+> 所以**溢出不再可能产生错误结果**,只可能导致收集不足。
+
+失败模式从"静默返回错的"降级为"响亮地收集不够",后者可检测、可自愈。
+
+### 候选溢出与阈值自愈
+
+直方图统计**全部**签名,不受候选缓冲容量影响,所以 `exactThresh` 始终可算。
+主机侧的重试规则因此非常简单:
+
+| 观察 | 含义 | 动作 |
+|---|---|---|
+| `collected ≥ topK` | 结果有效(全部 `d ≤ exactThresh`) | 完成,**即便 overflow=1** |
+| `collected < topK` | 粗阈值过紧,或溢出丢掉了合格项 | 令 `coarseThresh = exactThresh` 重跑 |
+| 在 `coarseThresh == exactThresh` 仍不足 | `candCap` 太小 | 增大 `candCap` 重跑 |
+
+两个方向都收敛到 `exactThresh`:过紧则放宽,过松则收紧。
+`overflow` 标志退化为**诊断信息**而非错误条件。
 
 ---
 
@@ -144,7 +175,7 @@ playbook §5.2)。**先看反汇编确认 builtin 是否真用上硬件指令** 
 
 ```
 链路流量/查询   C: 32B + k×4B ≈ 2 KB
-                B: 32B + N×2B = 200 MB (N=100M)
+                B: 32B + N×4B = 400 MB (N=100M)
                 A: 整库 3.2 GB 需入主机
 设备内实扫      N×32B = 3.2 GB
 有效带宽        3.2 GB / 扫描耗时  → 对照 268 GB/s
