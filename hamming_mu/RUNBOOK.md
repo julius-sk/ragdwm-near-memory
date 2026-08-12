@@ -120,3 +120,52 @@ PASS: 10000 个距离逐位一致
 3. 改了代码但行为没变(像是没生效)→ 加一行新的 `hostPrintf` 看它有没有出现,确认真的重新编译并重传了(不是跑到了旧的 `.mubin` 或旧的可执行文件)。
 
 **待办(需服务器执行后回填):** 实际 PASS/FAIL 输出、rep 计时、有效带宽数值。
+
+---
+
+### Task 5 Step 2: 扫 batchSize 建立基线
+
+**CRITICAL:** 此步必须在任何后续性能测量之前执行。`setBatchSize` 默认为 16,导致 `buildMap(fn, 2816)` 仅激活 `ceil(2816/16) = 176` 个核,其余 2640 个闲置 —— **16 倍性能差异**。若跳过或延后此步,后续所有测量都建立在错误的基线上。
+
+**Command:**
+```bash
+cd hamming_mu && chmod +x sweep.sh && ./sweep.sh 10000000 2816
+```
+
+**Expected Output:**
+- 6 行 batchSize 结果(b = 1, 2, 3, 4, 8, 16)
+- 预期形状是**中间有谷**: b=1 因分派开销放大而慢,b=16 因并行度不足而慢,最优通常在 **b=3~4**
+- 若最优就是 16,说明本负载的分派开销特征与 DRAN 参考项目不同 —— **记录下来,不要强行套用 DRAN 的结论**
+
+**若失败:**
+- 若全是 `FAIL`,检查 grep 模式是否与 `hamming_scan.cpp` 第 200 行的输出格式一致
+- 若输出不是数字而是标点符号(`:`),说明 awk 字段索引错误 —— 应为 `$6` 而非 `$5`(参考 hamming_scan.cpp 第 200 行的输出格式分析)
+
+---
+
+### Task 5 Step 3: 用最优 batchSize 扫 numSub
+
+**Command:**
+```bash
+cd hamming_mu && BEST_B=<上一步的最优值> ./sweep.sh 10000000 2816
+```
+
+**Expected Output:**
+- 4 行 numSub 结果(s = 4, 8, 16, 22)
+- 通常在 s=8~16 附近有较平缓的区域
+
+---
+
+### Task 5 Step 4: 记录结果
+
+**Command:**
+```bash
+编辑 hamming_mu/RESULTS.md,填入上述两个扫描的数字
+```
+
+**Expected Output:**
+- batchSize 表格中的 6 个测量值和最优值
+- numSub 表格中的 4 个测量值和最优值
+- 可选:计算有效带宽 = (scannedGB) / (min_ms / 1000) GB/s,其中 scannedGB 在 hamming_scan.cpp 输出中显示
+
+**待办(需服务器执行后回填):** batchSize 和 numSub 的实测值与最优值选择。
