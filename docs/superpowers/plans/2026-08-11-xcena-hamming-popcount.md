@@ -540,7 +540,8 @@ git commit -m "feat(hamming): numpy reference + data generator with self-tests"
 - Produces:
   - `scan_hist(sigs, query, task_count, coarse_thresh, cand_cap) -> (hist, cand, meta)`
     —— 精确模拟 `hamming_scan_hist`,`hist` 形状 `(task_count, 257)`,
-    `cand` 形状 `(task_count, cand_cap)`,`meta` 形状 `(task_count, 2)` = [candCount, overflow]
+    `cand` 形状 `(task_count, cand_cap * 2)`(交错 `(id, dist)`,`cand_cap` 计**条目数**),
+    `meta` 形状 `(task_count, 2)` = [candCount, overflow]
   - `merge_topk(hist, cand, meta, top_k) -> (ids, exact_thresh, any_overflow, collected)`
     —— 精确模拟 `hamming_merge_topk`
   - `run_with_retry(sigs, query, task_count, top_k, cand_cap, thresh0) -> (ids, n_attempts)`
@@ -567,7 +568,15 @@ from verify_host import BITS, NBUCKETS, WORDS, gen_sigs, hamming_all, topk_ids
 
 
 def _task_range(num_sigs, task_idx, task_count):
-    """与 kernel 的 myRange 逐行对应:均分,最后一个吃余数。"""
+    """与 kernel 的 myRange 逐行对应。
+
+    分块规则是 **ceil 分块**:每 task 取 ceil(n/taskCount) 个,末尾的 task
+    分到的**更少、甚至为空**(不是"最后一个吃掉余数")。两种约定给出不同划分,
+    例如 n=10, taskCount=4:
+        ceil 分块      -> [0,3) [3,6) [6,9) [9,10)
+        余数给最后一个 -> [0,2) [2,4) [4,6) [6,10)
+    C++ 侧的 myRange 必须用同一条规则,否则模型与设备会静默分歧。
+    """
     per_task = (num_sigs + task_count - 1) // task_count
     begin = task_idx * per_task
     end = min(begin + per_task, num_sigs)
@@ -824,7 +833,11 @@ inline int hammingDist(const uint64_t* s, const uint64_t* q)
     return d;
 }
 
-// 把 [0,numSigs) 均分给 taskCount 个 task,最后一个吃掉余数。
+// 把 [0,numSigs) 分给 taskCount 个 task,规则是 **ceil 分块**:
+// 每 task 取 ceil(n/taskCount) 个,末尾的 task 分到的更少、甚至为空
+// (不是"最后一个吃掉余数" —— 两种约定给出不同划分,n=10/tc=4 时
+//  ceil 分块是 [0,3)[3,6)[6,9)[9,10),余数给最后是 [0,2)[2,4)[4,6)[6,10))。
+// 必须与 model_kernel.py 的 _task_range 保持同一规则,否则模型与设备静默分歧。
 inline void myRange(uint64_t numSigs, uint64_t& begin, uint64_t& end)
 {
     const uint64_t taskIdx = mu::getTaskIdx();
