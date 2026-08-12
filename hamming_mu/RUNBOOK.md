@@ -76,3 +76,47 @@ $LLVM/bin/llvm-objdump -d hamming_mu/mu_kernel/mu_kernel.mubin \
 - 出现 `cpop` 指令 → `__builtin_popcountll` 被映射到了 RISC-V Zbb 扩展的硬件 popcount 指令 —— 默认(非 SWAR)变体应该更快或至少不慢于 SWAR。
 - 出现 `call`/`jal` 跳到某个 `__popcount`/`__popcountdi2` 之类的库函数 → 说明 builtin 退化成了软件实现(常见于目标 CPU 未声明 Zbb 扩展),此时手写的 SWAR 变体(`-DPOPCNT_SWAR`)很可能更快,因为它是内联的位运算而非函数调用。
 - **把观察到的是 `cpop` 还是 `call`/`jal`,以及具体指令文本,记录到本文件或 Task 8 的报告里** —— Task 8 的 popcount 对比任务需要这个结论来决定要不要以 SWAR 作为默认实现。
+
+---
+
+### Task 4 Step 2: 编译 host 驱动 hamming_scan
+
+**Command:**
+```bash
+cd hamming_mu && ./build.sh
+```
+
+**Expected Output:**
+- 编译无错误
+- `ls -la hamming_mu/hamming_scan` 存在且为本次新产物(时间戳更新)
+- `ls -la hamming_mu/mu_kernel/mu_kernel.mubin` 存在(Task 3 的 kernel 一并编译)
+
+**若失败:**
+- 报参数不匹配 / 找不到符号:确认 `hamming_scan.cpp` 里 `module->createFunction("hamming_scan_dists")` 的名字与 `mu_kernel/mu_hamming.cpp` 里 `MU_KERNEL_ADD(hamming_scan_dists)` 完全一致,且 `scanExec->execute(sigs, query, numSigs, dists)` 的参数顺序与个数与 kernel 签名 `(const uint64_t* sigs, const uint64_t* query, uint64_t numSigs, int32_t* outDists)` 一致。
+- 报 pxl 相关类型 / 返回值不匹配:对照 `dran_mu/dran_retrieve.cpp`(已知可用的同类 host 驱动)核实 `pxl::MemoryStatus`、`pxl::Result` 的用法,不要自行猜测 API。
+
+---
+
+### Task 4 Step 3: 小规模跑,与 numpy 逐位比对(本项目第一个真正的正确性关卡)
+
+**Command:**
+```bash
+python hamming_mu/verify_host.py gen -n 10000 -o /tmp/sig10k.bin
+cd hamming_mu
+./hamming_scan -n 10000 -t 64 --load /tmp/sig10k.bin --dump-dists /tmp/dev10k.i32
+cd -
+python hamming_mu/verify_host.py check --ref /tmp/sig10k.bin.dists.npy --dists /tmp/dev10k.i32
+```
+
+**Expected Output:**
+```
+PASS: 10000 个距离逐位一致
+```
+
+**若 FAIL,按此顺序诊断(不要跳过顺序,不要一上来就怀疑算法或编译器):**
+
+1. **结果错 + 每次运行结果不同 + 主机自查(host 侧读回来看)正常** → 三条症状同时出现,就是 `flushHostCache` 问题,先查 flush 调用位置(写完数据后、preload/kernel 执行前;kernel 执行后、host 读结果前 各一次)。**不要**去怀疑算法或编译器。
+2. 只错部分且稳定复现(每次运行结果一样但就是不对)→ 看 kernel 的 `hostPrintf` 原始比特(hex)输出,与 host 侧同一个值的 hex 对比。浮点/十进制格式化会掩盖差异,原始比特不会。
+3. 改了代码但行为没变(像是没生效)→ 加一行新的 `hostPrintf` 看它有没有出现,确认真的重新编译并重传了(不是跑到了旧的 `.mubin` 或旧的可执行文件)。
+
+**待办(需服务器执行后回填):** 实际 PASS/FAIL 输出、rep 计时、有效带宽数值。
