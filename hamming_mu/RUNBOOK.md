@@ -42,3 +42,37 @@ cd hamming_mu && ./build.sh
 
 **若失败:**
 若报 `half_float 未声明` 之类错误,说明误加了 half 相关代码 —— 本项目为纯整数路径,不应包含 `mu/vector/half.hpp`。
+
+---
+
+### Task 3 Step 2: 编译 hamming_scan_dists kernel
+
+**Command:**
+```bash
+cd hamming_mu && ./build.sh
+```
+
+**Expected Output:**
+- 编译无错误
+- `hamming_mu/mu_kernel/mu_kernel.mubin` 时间戳更新(确认是本次重新生成,不是旧产物)
+
+**若失败:**
+- 若报 `half_float 未声明` 之类错误,说明误加了 half 相关代码 —— 本项目为纯整数路径,`mu_hamming.cpp` 只应 `#include "mu/mu.hpp"`。
+- 若要构建 SWAR 变体做对比,加 `-DPOPCNT_SWAR`(需要临时改 `mu_kernel/CMakeLists.txt` 的 `compile_options` 或在 build.sh 里传参;Task 8 的对比会用到这两个变体)。
+
+---
+
+### Task 3 Step 3: 反汇编确认 popcount 是否映射到硬件指令
+
+**Command:**
+```bash
+source /usr/local/mu_library/mu/script/min_llvm_version_env.sh
+LLVM=/usr/local/mu_library/mu_llvm/$XCENA_LLVM_VERSION/$MU_REVISION
+$LLVM/bin/llvm-objdump -d hamming_mu/mu_kernel/mu_kernel.mubin \
+  | grep -A40 '<hamming_scan_dists>' | grep -iE 'cpop|call|jal' | head -20
+```
+
+**Expected Output / 如何解读:**
+- 出现 `cpop` 指令 → `__builtin_popcountll` 被映射到了 RISC-V Zbb 扩展的硬件 popcount 指令 —— 默认(非 SWAR)变体应该更快或至少不慢于 SWAR。
+- 出现 `call`/`jal` 跳到某个 `__popcount`/`__popcountdi2` 之类的库函数 → 说明 builtin 退化成了软件实现(常见于目标 CPU 未声明 Zbb 扩展),此时手写的 SWAR 变体(`-DPOPCNT_SWAR`)很可能更快,因为它是内联的位运算而非函数调用。
+- **把观察到的是 `cpop` 还是 `call`/`jal`,以及具体指令文本,记录到本文件或 Task 8 的报告里** —— Task 8 的 popcount 对比任务需要这个结论来决定要不要以 SWAR 作为默认实现。
