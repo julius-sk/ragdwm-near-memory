@@ -615,7 +615,25 @@ def _fuzz():
     hist, _cand, _meta = scan_hist(sigs, query, 4, coarse_thresh=BITS, cand_cap=1)
     assert hist.sum() == len(sigs), "直方图丢了签名 —— 溢出自愈的前提被破坏"
 
-    print("model fuzz: ALL PASS (200 随机 + 定向用例)")
+    # ---- 回归用例:粗阈值远大于精确阈值时的静默错误 ----
+    # 初版设计(候选只存 id、merge 不按 exact_thresh 过滤)在此处会
+    # "成功门通过但结果错":返回距离 145,而真实第 k 名距离是 113。
+    # 这个用例锁死该 bug,任何回退到"不过滤"的改动都会在这里响亮失败。
+    sigs = gen_sigs(2000, seed=0)
+    query = gen_sigs(1, seed=9999)[0]
+    ref = hamming_all(sigs, query)
+    k = 50
+    kth = int(np.sort(ref)[k - 1])
+    for coarse in (BITS, 148, 130, kth):          # 从极松到刚好
+        hist, cand, meta = scan_hist(sigs, query, 4, coarse, cand_cap=100000)
+        ids, exact_thresh, _ov, collected = merge_topk(hist, cand, meta, k)
+        assert exact_thresh == kth, f"coarse={coarse}: 精确阈值 {exact_thresh} != 第k名 {kth}"
+        assert collected == k, f"coarse={coarse}: 只收集到 {collected}/{k}"
+        assert ref[ids].max() <= kth, (
+            f"coarse={coarse}: 返回距离 {ref[ids].max()} > 第k名 {kth} —— "
+            "候选未按 exact_thresh 过滤(静默错误回归)")
+
+    print("model fuzz: ALL PASS (200 随机 + 定向用例 + 松阈值回归)")
 
 
 if __name__ == "__main__":
@@ -634,11 +652,15 @@ Expected: FAIL —— `NameError: name 'run_with_retry' is not defined`
 
 ```python
 def scan_hist(sigs, query, task_count, coarse_thresh, cand_cap):
-    """模拟 hamming_scan_hist:每 task 一份 257 桶直方图 + 候选分片。"""
+    """模拟 hamming_scan_hist:每 task 一份 257 桶直方图 + 候选分片。
+
+    候选交错存放 (id, dist):cand[t, 2j]=id, cand[t, 2j+1]=dist。
+    存距离是正确性的必要条件 —— 见 merge_topk 的过滤。
+    """
     n = len(sigs)
     dists = hamming_all(sigs, query)
     hist = np.zeros((task_count, NBUCKETS), dtype=np.uint32)
-    cand = np.zeros((task_count, cand_cap), dtype=np.uint32)
+    cand = np.zeros((task_count, cand_cap * 2), dtype=np.uint32)   # 交错 (id, dist)
     meta = np.zeros((task_count, 2), dtype=np.uint32)   # [candCount, overflow]
 
     for t in range(task_count):
@@ -650,7 +672,8 @@ def scan_hist(sigs, query, task_count, coarse_thresh, cand_cap):
             hist[t, d] += 1                      # 直方图统计全部,不受 cap 影响
             if d <= coarse_thresh:
                 if n_cand < cand_cap:
-                    cand[t, n_cand] = i
+                    cand[t, 2 * n_cand] = i
+                    cand[t, 2 * n_cand + 1] = d  # ★ 必须连距离一起存
                     n_cand += 1
                 else:
                     overflow = 1                 # 记录但不中断
@@ -660,7 +683,7 @@ def scan_hist(sigs, query, task_count, coarse_thresh, cand_cap):
 
 
 def merge_topk(hist, cand, meta, top_k):
-    """模拟 hamming_merge_topk:归并直方图定精确阈值,收集候选。"""
+    """模拟 hamming_merge_topk:归并直方图定精确阈值,按阈值过滤候选。"""
     task_count = hist.shape[0]
     total = hist.sum(axis=0, dtype=np.uint64)
 
@@ -674,6 +697,8 @@ def merge_topk(hist, cand, meta, top_k):
 
     any_overflow = int(meta[:, 1].any())
 
+    # ★ 只收 dist <= exact_thresh 的候选。没有这一步,粗阈值偏大时会返回
+    #   宽带里的任意 id(已复现的静默错误:返回距离 145 而真实第k名是 113)。
     ids = []
     for t in range(task_count):
         if len(ids) >= top_k:
@@ -682,25 +707,33 @@ def merge_topk(hist, cand, meta, top_k):
         for j in range(cnt):
             if len(ids) >= top_k:
                 break
-            ids.append(int(cand[t, j]))
+            if int(cand[t, 2 * j + 1]) <= exact_thresh:
+                ids.append(int(cand[t, 2 * j]))
 
     collected = len(ids)
     return np.array(ids, dtype=np.uint32), exact_thresh, any_overflow, collected
 
 
 def run_with_retry(sigs, query, task_count, top_k, cand_cap, thresh0, max_attempts=5):
-    """模拟 host 端的溢出/收集不足重试循环。"""
+    """模拟 host 端的重试循环。
+
+    因为 merge 已按 exact_thresh 过滤,收集到的 id 必然满足 d <= 第k名距离,
+    所以**溢出不会产生错误结果**,只可能导致收集不足。重试条件因此只看数量:
+      collected >= top_k          -> 完成(即便 overflow=1)
+      collected <  top_k          -> 令 thresh = exact_thresh 重跑
+                                     (过紧则放宽、过松则收紧,两个方向都收敛)
+      已在 exact_thresh 仍不足    -> cand_cap 太小,调用方需增大它
+    """
     thresh = thresh0
     attempts = 0
     ids = np.array([], dtype=np.uint32)
     for _ in range(max_attempts):
         hist, cand, meta = scan_hist(sigs, query, task_count, thresh, cand_cap)
         ids, exact_thresh, any_overflow, collected = merge_topk(hist, cand, meta, top_k)
-        if not any_overflow and collected >= top_k:
+        if collected >= top_k:
             break
-        # 两种情况都收敛到 kernel 算出的精确阈值
         if thresh == exact_thresh:
-            break                                 # 已在精确阈值,再重试无意义
+            break            # 已在精确阈值仍不足 -> cand_cap 受限,重试无用
         thresh = exact_thresh
         attempts += 1
     return ids, attempts
@@ -1290,7 +1323,10 @@ git commit -m "perf(hamming): sweep batchSize/numSub, establish real baseline"
                          int32_t candCap, uint32_t* outHist,
                          uint32_t* outCand, uint32_t* outMeta)
   // outHist : taskCount * 257 uint32   每 task 的距离直方图
-  // outCand : taskCount * candCap uint32  每 task 的候选 id 分片
+  // outCand : taskCount * candCap * 2 uint32  每 task 的候选分片,
+  //           交错存放 (id, dist):cand[2j]=id, cand[2j+1]=dist。
+  //           ★ 必须连距离一起存 —— merge 要按 exactThresh 过滤。
+  //           candCap 计的是**条目数**,故缓冲字节数 = taskCount*candCap*2*4。
   // outMeta : taskCount * 2 uint32     [0]=candCount  [1]=overflow(0/1)
 
   void hamming_merge_topk(const uint32_t* hist, const uint32_t* cand,
@@ -1307,9 +1343,26 @@ git commit -m "perf(hamming): sweep batchSize/numSub, establish real baseline"
 
   **host 必须为 outIds 分配 `topK + 3` 个 uint32。**
 
+**★ 候选必须带距离(一个已复现的静默错误):**
+初版设计里候选只存 id、merge 按索引序取前 k 个 —— **错的,而且是静默的**。
+候选只满足 `d ≤ coarseThresh`;当 `coarseThresh > exactThresh` 时,按索引序
+取前 k 个会取到宽带里的任意 id。实测(n=2000, k=50, coarse=148, cap 足够大):
+`overflow=0, collected=50 → 成功门通过`,但返回 id 的最大距离 **145**,
+而真实第 k 名距离是 **113**。成功门通过、结果却是错的。
+
+**修法:候选交错存 (id, dist),merge 按 `exactThresh` 真的过滤。**
+由此得到关键性质:**过滤后每个返回 id 都满足 `d ≤ exactThresh = 第k名距离`,
+所以溢出不再可能产生错误结果,只可能导致收集不足** ——
+失败模式从"静默返回错的"降级为"响亮地收集不够"。
+
 **溢出为什么能自我修复:** 直方图统计**全部**签名,不受候选缓冲容量影响,
-所以第 k 名的精确距离阈值**始终可算**。溢出只影响候选 id 的收集,
-用精确阈值回退重扫即可补齐。
+所以 `exactThresh` **始终可算**。主机据此调整:收集不足就令
+`coarseThresh = exactThresh` 重跑(过紧则放宽、过松则收紧,两个方向都收敛);
+在 `exactThresh` 仍不足则说明 `candCap` 太小。
+
+**算法已在 Task 2b 用 Python 建模并模糊测试通过** —— 
+`hamming_mu/model_kernel.py` 是本 kernel 的可执行参考,逐行对应。
+写 C++ 时如与模型不一致,以模型为准(它验证过,C++ 无法本地编译)。
 
 - [ ] **Step 1: 追加两个 kernel**
 
@@ -1319,11 +1372,15 @@ git commit -m "perf(hamming): sweep batchSize/numSub, establish real baseline"
 // ---------------------------------------------------------------------------
 // C 组 stage 1 —— 扫描 + 每 task 257 桶直方图 + 候选收集。
 //
-//   coarseThresh : 粗阈值,dist <= 此值的 id 收进候选分片
-//   candCap      : 每 task 候选分片容量
+//   coarseThresh : 粗阈值,dist <= 此值的候选收进分片
+//   candCap      : 每 task 候选**条目数**上限(每条目 2 个 uint32)
 //   outHist      : taskCount * 257 uint32
-//   outCand      : taskCount * candCap uint32
+//   outCand      : taskCount * candCap * 2 uint32 —— 交错 (id, dist)
 //   outMeta      : taskCount * 2 uint32 —— [0]=candCount [1]=overflow
+//
+// ★ 候选必须连距离一起存。只存 id 的话 merge 无法按 exactThresh 过滤,
+//   粗阈值偏大时会静默返回宽带里的任意 id(实测:返回距离 145,真实第k名 113,
+//   而成功门仍然通过)。详见 Task 2b 的模型与回归用例。
 //
 // 直方图放在堆上而非栈上:257 * 4 = 1028 B 虽然放得下 64 KB 栈,但显式用
 // 传入的设备内存分片更省栈,也便于 merge kernel 直接读。
@@ -1345,7 +1402,7 @@ void hamming_scan_hist(const uint64_t* sigs,
     for (int w = 0; w < WORDS; w++) q[w] = query[w];
 
     uint32_t* myHist = outHist + (uint64_t)taskIdx * (BITS + 1);
-    uint32_t* myCand = outCand + (uint64_t)taskIdx * (uint64_t)candCap;
+    uint32_t* myCand = outCand + (uint64_t)taskIdx * (uint64_t)candCap * 2;  // 每条目 2 个 uint32
     uint32_t* myMeta = outMeta + (uint64_t)taskIdx * 2;
 
     for (int b = 0; b <= BITS; b++) myHist[b] = 0u;
@@ -1359,7 +1416,12 @@ void hamming_scan_hist(const uint64_t* sigs,
         myHist[d]++;                       // 距离有界 -> 计数排序的基础
         if (d <= coarseThresh)
         {
-            if (nCand < (uint32_t)candCap) myCand[nCand++] = (uint32_t)i;
+            if (nCand < (uint32_t)candCap)
+            {
+                myCand[2 * nCand] = (uint32_t)i;      // id
+                myCand[2 * nCand + 1] = (uint32_t)d;  // ★ 距离必须一起存
+                nCand++;
+            }
             else overflow = 1u;            // 记录但不中断:直方图仍然完整
         }
     }
@@ -1421,15 +1483,18 @@ void hamming_merge_topk(const uint32_t* hist,
 
     mu::hostPrintf("[kernel] exactThresh=%d anyOverflow=%d\n", exactThresh, anyOverflow);
 
-    // 收集候选。溢出与否都走同一条收集路径 —— 差别只在 host 是否需要用
-    // 收紧后的阈值重跑一轮(见 host 驱动的重跑循环)。这里把 exactThresh 与
-    // 溢出标志写进 outIds 尾部的两个哨兵槽,host 据此决策。
+    // ★ 只收 dist <= exactThresh 的候选。没有这个过滤,粗阈值偏大时会返回
+    //   宽带里的任意 id —— 已复现的静默错误(返回距离 145,真实第k名 113)。
+    //   有了它,每个返回 id 必然满足 d <= 第k名距离,溢出便不再能产生错误结果。
     int n = 0;
     for (int t = 0; t < taskCount && n < topK; t++)
     {
         const uint32_t cnt = meta[(uint64_t)t * 2];
-        const uint32_t* c = cand + (uint64_t)t * (uint64_t)candCap;
-        for (uint32_t j = 0; j < cnt && n < topK; j++) outIds[n++] = c[j];
+        const uint32_t* c = cand + (uint64_t)t * (uint64_t)candCap * 2;
+        for (uint32_t j = 0; j < cnt && n < topK; j++)
+        {
+            if ((int)c[2 * j + 1] <= exactThresh) outIds[n++] = c[2 * j];
+        }
     }
 
     // 不足 topK 时用哨兵填充,host 可据此判断收集是否完整
@@ -1514,7 +1579,8 @@ git commit -m "feat(hamming): counting-sort top-k kernels with overflow detectio
 
 ```cpp
     const size_t offHist = modeC ? reserve((size_t)taskCount * 257 * sizeof(uint32_t)) : 0;
-    const size_t offCand = modeC ? reserve((size_t)taskCount * candCap * sizeof(uint32_t)) : 0;
+    // 候选交错存 (id, dist) -> 每条目 2 个 uint32
+    const size_t offCand = modeC ? reserve((size_t)taskCount * candCap * 2 * sizeof(uint32_t)) : 0;
     const size_t offMeta = modeC ? reserve((size_t)taskCount * 2 * sizeof(uint32_t)) : 0;
     // outIds 需要 topK + 3 个槽位:尾部 3 个是 kernel 回传的
     // exactThresh / anyOverflow / collected
@@ -1591,29 +1657,34 @@ git commit -m "feat(hamming): counting-sort top-k kernels with overflow detectio
         double s = 0, m = 0;
         if (!runOnce(s, m)) { printf("warmup failed\n"); return 1; }   // warmup
 
-        // 溢出/收集不足检查:收紧阈值重跑,最多 5 次。
+        // 重试循环。merge 已按 exactThresh 过滤候选,所以收集到的 id 必然满足
+        // d <= 第k名距离 —— **溢出不会产生错误结果**,只可能导致收集不足。
+        // 因此重试条件只看数量,overflow 退化为诊断信息。
         // kernel 把状态写在 outIds 尾部三个槽位,读之前必须 flush(失效方向)。
         for (int attempt = 0; attempt < 5; attempt++)
         {
             pxl::flushHostCache(ids, (size_t)(topK + 3) * sizeof(uint32_t));
-            const uint32_t exactThresh = ids[topK];
+            const int      exactThresh = (int)ids[topK];
             const uint32_t overflow    = ids[topK + 1];
             const uint32_t collected   = ids[topK + 2];
-            if (!overflow && collected >= (uint32_t)topK) break;
 
-            if (collected < (uint32_t)topK)
+            if (collected >= (uint32_t)topK)
             {
-                // 收集不足:粗阈值太紧,放宽到 kernel 算出的精确阈值
-                coarseThresh = (int)exactThresh;
-                printf("  收集不足(%u/%d)-> 放宽 coarseThresh 到精确阈值 %d 重跑\n",
-                       collected, topK, coarseThresh);
+                if (overflow)
+                    printf("  注:发生过候选溢出,但结果仍有效(全部 d <= 精确阈值 %d)\n",
+                           exactThresh);
+                break;
             }
-            else
+            if (coarseThresh == exactThresh)
             {
-                // 溢出:粗阈值太松,收紧到精确阈值(必然 <= 当前粗阈值)
-                coarseThresh = (int)exactThresh;
-                printf("  候选溢出 -> 收紧 coarseThresh 到精确阈值 %d 重跑\n", coarseThresh);
+                printf("  已在精确阈值 %d 仍只收集到 %u/%d -> candCap(%d)太小\n",
+                       exactThresh, collected, topK, candCap);
+                break;                       // 重试无用,需增大 candCap
             }
+            // 过紧则放宽、过松则收紧 —— 两个方向都收敛到精确阈值
+            printf("  收集不足(%u/%d)-> coarseThresh %d -> 精确阈值 %d 重跑\n",
+                   collected, topK, coarseThresh, exactThresh);
+            coarseThresh = exactThresh;
             if (!runOnce(s, m)) { printf("rescan failed\n"); return 1; }
         }
         pxl::flushHostCache(ids, (size_t)(topK + 3) * sizeof(uint32_t));
@@ -1717,12 +1788,17 @@ python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --id
 
 (只用 4 个 task,每 task 要扫 2500 个签名,候选远超 `candCap = 400`,必然溢出。)
 
-Expected: 输出中出现 `候选溢出 -> 收紧 coarseThresh 到精确阈值 <某个 < 118 的数> 重跑`
-(kernel 端也会打印 `[kernel] task0 ... overflow=1`),且最终 `check-topk` 仍 `PASS` ——
-这证明溢出被检测到并自愈,没有静默丢结果。
+Expected: kernel 端打印 `[kernel] task0 ... overflow=1`,且最终 `check-topk` **PASS**。
 
-若反过来看到 `收集不足(...)-> 放宽 ...`,说明 118 这个粗阈值对该数据偏紧,
-同样属于正常自愈路径,最终 `PASS` 即可。
+主机侧会出现下面两种之一,都是正确行为:
+- `注:发生过候选溢出,但结果仍有效(全部 d <= 精确阈值 N)` ——
+  溢出了但仍收集够 k 个。因为 merge 已按 exactThresh 过滤,这些 id **全部合格**,
+  无需重跑。这正是 Option B 带来的性质。
+- `收集不足(x/100)-> coarseThresh 118 -> 精确阈值 N 重跑` ——
+  溢出丢掉了太多合格项,收敛到精确阈值后重跑。
+
+**关键判据是 `check-topk` PASS**,它现在同时检查距离与 id 唯一性(Task 2 已加固)。
+若看到 `已在精确阈值 N 仍只收集到 x/100 -> candCap 太小`,把 `candCap` 调大重试。
 
 - [ ] **Step 5: 提交**
 
