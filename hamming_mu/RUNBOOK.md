@@ -2,6 +2,103 @@
 
 ## 待服务器验证
 
+### Task 8 Step 2: A 组 host 基线必须在服务器上重跑
+
+**背景:** Task 8 已在本地开发机(dev machine,Windows,Intel i9-9880H,numpy 2.4.6)
+用 `hamming_mu/bench_host_baseline.py` 跑通 A 组基线(N=1M 与 N=10M),确认了实现
+正确(与 `verify_host.py` 的 `check-topk` 交叉验证 PASS)、`bitwise_count` 路径可用、
+mean Hamming 距离约 128(符合随机签名预期)。但这些数字**只是 provisional 的
+健全性检查**,不能进入论文的 A vs B/C 对比——本项目的测量纪律要求 A 组基线必须
+与 B/C 两组的设备(device)测量在**同一台机器**上跑,跨机器数字不可比(不同 CPU、
+不同内存带宽、不同 numpy build)。
+
+**Command:**
+```bash
+cd hamming_mu
+python bench_host_baseline.py -n 1000000 -k 500 --reps 5
+python bench_host_baseline.py -n 10000000 -k 500 --reps 5
+python bench_host_baseline.py -n 100000000 -k 500 --reps 5
+```
+
+**Expected Output:**
+- 三个 N 各自的最小耗时(ms)与有效带宽(GB/s)
+- 确认输出中 `bitwise_count=True`(即用了原生 popcount 路径,而非
+  `np.unpackbits` 查表法回退;若服务器 numpy 版本 < 2.0 导致回退,需在
+  `RESULTS.md` 中明确记录用了哪条路径,两条路径性能可能有数量级差异)
+
+**若失败:**
+- N=100M 若 OOM 或换页明显(比 N=10M 单条数据的线性外推慢很多):降到能安全跑的
+  最大 N,并在 `RESULTS.md` 中注明本机的规模上限(dev 机上因可用内存仅约 3.2 GB
+  已跳过 N=100M,原因需一并记录,不要沉默跳过)。
+
+**产出去向:** 用服务器上测得的 A 组数字**替换** `RESULTS.md` 中标注为
+"dev 机 provisional"的三个单元格(1M/10M/100M 的 A host-only 行),并去掉
+"provisional / 非最终对比口径"的标注;之后"三组对比"表格与"诚实边界"章节里
+关于 A↔C 机器不一致的警告段落才能删除或改写为"已同机测量,数字可比"。
+
+---
+
+### Task 8 Step 3: 跑 B、C 两组(用 Task 5 的最优参数),填三组对比表的 B/C 单元格
+
+**Command:**
+```bash
+cd hamming_mu
+B=<Task5最优batchSize>; S=<Task5最优numSub>
+for N in 1000000 10000000 100000000; do
+  echo "=== N=$N mode B ==="
+  ./hamming_scan -n $N -k 500 -t 2816 -b $B -s $S --mode B --reps 5 | tail -20
+  echo "=== N=$N mode C ==="
+  ./hamming_scan -n $N -k 500 -t 2816 -b $B -s $S --mode C --reps 5 | tail -20
+done
+```
+
+**Expected Output:**
+- 6 组输出(N × {B,C})。N=100M 时 arena 约 3.2 GB(mode B 另需 400 MB 距离数组),
+  需确认 Preload Region 有足够 1 GB 槽位;若 `preloadMemory failed`,降到 N=50M
+  并在 `RESULTS.md` 中注明规模上限。
+
+**产出去向:** 填入 `RESULTS.md` "三组对比"表中对应 N × {B,C} 的"每查询延迟"单元格。
+
+---
+
+### Task 8 Step 4: popcount 双实现(builtin vs SWAR)对比,填 popcount 对比表
+
+**Command:**
+```bash
+cd hamming_mu
+# 默认 builtin 版已在 Step 3 测过,现在编 SWAR 版
+sed -i 's/^set(compile_options/set(compile_options\n    -DPOPCNT_SWAR/' mu_kernel/CMakeLists.txt
+./build.sh
+./hamming_scan -n 10000000 -k 500 -t 2816 -b $B -s $S --mode C --reps 5 | grep -E 'scan \(min|有效带宽'
+# 验证 SWAR 版同样正确 —— 不能只看它"更快",必须先过 check-topk
+./hamming_scan -n 10000 -k 100 -t 64 --mode C --load /tmp/sig10k.bin --dump-ids /tmp/swar.ids
+cd -
+python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --ids /tmp/swar.ids -k 100
+```
+
+**Expected Output:**
+- SWAR 版 `check-topk` 必须同样 `PASS`。**这是本步骤的门槛,不是可选项**:
+  DRAN 项目的教训是手写整数路径在 `-O3` 下不能假定必然正确——一个跑得快但算错的
+  SWAR 实现,如果不先过正确性关卡,看起来会像"性能胜出",但那是假胜出。
+  只有 `check-topk` PASS 之后,SWAR 版的计时数字才可以写进 `RESULTS.md` 的
+  popcount 对比表;若 FAIL,先修 kernel,不要记录它的计时。
+- 记录两版(builtin / SWAR)的 scan 耗时与有效带宽差异。
+- 同时把 Task 3 Step 3 反汇编步骤得到的"是 `cpop` 硬件指令还是 `call`/`jal`
+  库函数调用"结论填进 `RESULTS.md` 该表下方的"反汇编观察"一行——这决定了
+  两个实现差异的成因解释,不只是记两个数字。
+
+**测完后恢复 builtin 版(若 builtin 更快,或作为默认发布配置):**
+```bash
+cd hamming_mu && sed -i '/-DPOPCNT_SWAR/d' mu_kernel/CMakeLists.txt && ./build.sh && cd -
+```
+恢复后建议重跑一次 Task 4 Step 3 的 `check --ref ... --dists ...` 逐位比对,
+确认 `sed -i` 撤销没有把 `CMakeLists.txt` 改坏(比如误删了原有别的编译选项)。
+
+**产出去向:** 填入 `RESULTS.md` "popcount 实现对比"表(builtin 与 SWAR 两行的
+`scan (ms)`、`有效带宽 (GB/s)`、`正确性` 三列)与其下方的反汇编观察一行。
+
+---
+
 ### Task 6 Step 2: 编译 hamming_scan_hist / hamming_merge_topk kernel
 
 **Command:**
