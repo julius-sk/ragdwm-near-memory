@@ -35,8 +35,13 @@ def hamming_all(sigs, query):
 
 
 def topk_ids(dists, k):
-    """最近的 k 个 id,按 (距离升序, id 升序) 稳定排序,返回 (k,) uint32。"""
+    """最近的 k 个 id,按 (距离升序, id 升序) 稳定排序,返回 (min(k,n),) uint32。
+
+    若 k > n,返回全部 n 个 id;否则返回前 k 个。
+    """
     dists = np.asarray(dists)
+    n = len(dists)
+    k = min(k, n)  # Clamp k to n
     order = np.argsort(dists, kind="stable")   # stable => 平局按 id 升序
     return order[:k].astype(np.uint32)
 
@@ -68,6 +73,26 @@ def _self_test():
     # 6. top-k 必须按 (距离, id) 稳定排序
     dd = np.array([3, 1, 1, 0, 5], dtype=np.int32)
     assert list(topk_ids(dd, 3)) == [3, 1, 2], "top-k 平局需按 id 升序"
+
+    # 7. k > n 时必须被 clamp 到 n
+    dd_short = np.array([2, 5, 1], dtype=np.int32)
+    result_k_gt_n = topk_ids(dd_short, k=10)
+    assert len(result_k_gt_n) == 3, f"k > n 应 clamp 到 n=3,得到 {len(result_k_gt_n)}"
+    assert list(result_k_gt_n) == [2, 0, 1], "k > n 时应返回全部 n 个 id"
+
+    # 8. 重复 id 检查:模拟设备返回重复 id,验证检查逻辑会拒绝
+    ref_dists = np.array([10, 20, 30, 40, 50], dtype=np.int32)
+    duplicate_ids = np.array([0, 0, 1], dtype=np.uint32)  # 重复 id 0
+    # 模拟 _cmd_check_topk 的唯一性检查逻辑
+    got_unique_count = len(set(duplicate_ids.tolist()))
+    assert got_unique_count != len(duplicate_ids), "重复 id 案例应有重复"
+    # 验证能检测出重复
+    unique_ids_dict = {}
+    for id_val in duplicate_ids:
+        unique_ids_dict[id_val] = unique_ids_dict.get(id_val, 0) + 1
+    duplicates = {id_val: count for id_val, count in unique_ids_dict.items() if count > 1}
+    assert len(duplicates) > 0, "应检测出重复"
+    assert duplicates[0] == 2, "id 0 应出现 2 次"
 
     print("self-test: ALL PASS")
 
@@ -105,6 +130,16 @@ def _cmd_check_topk(args):
     got = np.fromfile(args.ids, dtype=np.uint32)
     if got.size != args.k:
         print(f"FAIL: 期望 {args.k} 个 id,得到 {got.size}")
+        sys.exit(1)
+    # 检查唯一性:不能有重复 id
+    if len(set(got.tolist())) != len(got):
+        # 找出哪个 id 重复了
+        unique_ids = {}
+        for id_val in got:
+            unique_ids[id_val] = unique_ids.get(id_val, 0) + 1
+        duplicates = {id_val: count for id_val, count in unique_ids.items() if count > 1}
+        first_dup = sorted(duplicates.items())[0]
+        print(f"FAIL: id {first_dup[0]} 出现 {first_dup[1]} 次 (期望唯一)")
         sys.exit(1)
     # 平局可能使具体 id 不同,但每个返回 id 的距离必须 <= 第 k 名的距离
     kth = np.sort(ref)[args.k - 1]
