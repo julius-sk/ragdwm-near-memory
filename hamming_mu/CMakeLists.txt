@@ -28,6 +28,24 @@ foreach(file ${src})
     install(TARGETS ${target} RUNTIME DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
 endforeach()
 
+# --- A 组主机基线(C + OpenMP)------------------------------------------
+# 与 PXL、与设备完全无关,只是个多线程 CPU 实现。
+# **刻意做成可选**:OpenMP 找不到就跳过并给出手工编译命令,绝不让一个基线
+# 工具拖垮已经跑通的设备侧构建。
+find_package(OpenMP COMPONENTS C QUIET)
+if (OpenMP_C_FOUND)
+    add_executable(bench_host_c bench_host_c.c)
+    target_link_libraries(bench_host_c PRIVATE OpenMP::OpenMP_C)
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench_host_c PRIVATE -O3 -march=native)
+    endif()
+    install(TARGETS bench_host_c RUNTIME DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+    message(STATUS "bench_host_c: OpenMP found -> will build")
+else()
+    message(STATUS "bench_host_c: OpenMP NOT found -> skipped. 手工编译:")
+    message(STATUS "  gcc -O3 -march=native -fopenmp -o bench_host_c bench_host_c.c")
+endif()
+
 include(ExternalProject)
 ExternalProject_Add(build_mu_${PROJECT_NAME}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mu_kernel
