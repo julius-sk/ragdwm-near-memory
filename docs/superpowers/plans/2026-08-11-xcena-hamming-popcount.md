@@ -4,7 +4,7 @@
 
 **Goal:** 在 XCENA MX1P 上实现 256 位签名的 Hamming 距离扫描与 top-k 选择,产出"近内存 vs host"的三组可信对比数字,用于 DWM/RAGDWM 论文的硬件章节。
 
-**Architecture:** 两个 MU kernel —— `scan_hamming` 分条扫描签名(每 task 一段连续内存,XOR+POPCOUNT 得 0~256 距离,累加 257 桶直方图并收集候选),`merge_topk` 单 task 归并直方图定出精确距离阈值并收集 k 个 id。主机侧单 arena + flushHostCache + 命令行旋钮。三组对比:A=host numba 基线,B=设备扫描回传全部距离,C=设备扫描+设备 top-k。
+**Architecture:** 两个 MU kernel —— `scan_hamming` 分条扫描签名(每 task 一段连续内存,XOR+POPCOUNT 得 0~256 距离,累加 257 桶直方图并收集候选),`merge_topk` 单 task 归并直方图定出精确距离阈值并收集 k 个 id。主机侧单 arena + flushHostCache + 命令行旋钮。三组对比:A=host numpy `bitwise_count` 基线,B=设备扫描回传全部距离,C=设备扫描+设备 top-k。
 
 **Tech Stack:** XCENA SDK v1.4.9、PXL C++ host API、MU LLVM RISC-V 工具链(riscv64 / metisx-d)、CMake + Ninja、Python 3 + numpy(参考实现与比对)。
 

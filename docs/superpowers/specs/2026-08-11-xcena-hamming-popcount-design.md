@@ -27,8 +27,8 @@
 
 | 组 | 做法 | 链路流量/查询 |
 |---|---|---|
-| **A** host-only | numba 融合 popcount,数据在主机 | 整库需入主机 |
-| **B** 设备扫描 + host 选 | 设备算距离,回传 N 个距离,host 选 top-k | query 32B + N×2B |
+| **A** host-only | numpy `bitwise_count` 融合 popcount,数据在主机 | 整库需入主机 |
+| **B** 设备扫描 + host 选 | 设备算距离,回传 N 个距离,host 选 top-k | query 32B + N×4B |
 | **C** 设备扫描 + 设备选 | 设备算距离 + 计数排序 top-k,只回 k 个 id | query 32B + k×4B ≈ 2 KB |
 
 - **A ↔ C** = 近内存的价值
@@ -175,7 +175,7 @@ playbook §5.2)。**先看反汇编确认 builtin 是否真用上硬件指令** 
 
 ```
 链路流量/查询   C: 32B + k×4B ≈ 2 KB
-                B: 32B + N×2B = 200 MB (N=100M)
+                B: 32B + N×4B = 400 MB (N=100M)
                 A: 整库 3.2 GB 需入主机
 设备内实扫      N×32B = 3.2 GB
 有效带宽        3.2 GB / 扫描耗时  → 对照 268 GB/s

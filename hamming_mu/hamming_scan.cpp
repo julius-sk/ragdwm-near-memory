@@ -1,6 +1,8 @@
 // hamming_scan.cpp — host 驱动:MX1P 上的 Hamming 扫描与 top-k。
 //
-// 三组对比中的 B 组(本文件当前实现):设备算距离,回传全部 N 个距离。
+// 三组对比中的 B、C 组(本文件当前实现,--mode 切换):
+// B 组设备算距离、回传全部 N 个距离;C 组设备算距离并在设备侧做计数排序
+// top-k,只回传 k 个 id。
 // 内存:MU 核touch 的一切都必须在 Preload Region,而 preloadMemory 以
 // 1 GB 对齐 + 1 GB 整数倍工作。所以只分配一个 arena,preload 一次,
 // 所有 buffer 按偏移切入 —— 单独 preload 一个 32 B 的 query 会烧掉整个 1 GB 槽位。
@@ -316,9 +318,14 @@ int main(int argc, char* argv[])
             if (!runOnce(s, m)) { printf("execute failed\n"); return 1; }
             if (s < bestScan) bestScan = s;
             if (m < bestMerge) bestMerge = m;
+            // headline 总数取"同一 rep 内 scan+merge 之和"的最小值,而不是
+            // bestScan+bestMerge(两个可能来自不同 rep 的独立最小值相加)——
+            // 后者会让总数低于任何一次实际观测到的单次运行,且与 mode B
+            // (取 totals 的 min)不对称。bestScan/bestMerge 仍单独保留、
+            // 单独报告,仅作为 informational 行。
+            if (s + m < best) best = s + m;
             printf("  rep %d: scan %.3f ms  merge %.3f ms\n", r, s, m);
         }
-        best = bestScan + bestMerge;
         // 链路流量只算真正的结果(k 个 id);尾部 3 个状态槽是调试用,
         // 生产实现里不需要,故不计入对外报告的流量。
         outBytes = (size_t)topK * sizeof(uint32_t);

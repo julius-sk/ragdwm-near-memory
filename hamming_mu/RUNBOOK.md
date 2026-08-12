@@ -279,28 +279,79 @@ PASS: 100 个 id 距离全部 <= 第k名(...)
 
 ### 5.4 验证候选溢出路径真的会触发并自愈
 
+**注:为什么是 `-t 2`,不是 `-t 4`。** 早先版本的本节用 `-t 4 -k 100`,声称
+"候选数远超 candCap=topK*4=400,必然触发 overflow=1"——这个算术是错的。
+`coarseThresh=118` 下,`P(Hamming ≤ 118) ≈ 0.1175`(随机 256 位签名,理论
+二项分布);`-t 4` 时每 task 扫 2500 个签名,期望候选数 ≈ 2500×0.1175 ≈ 293,
+**低于** 400 的 cap,不会溢出。用 `model_kernel.py` 独立复现(见下方"复现记录"):
+`-t 4` 的每 task 候选数是 `[292,300,284,284]`,`overflow=0`,`collected=100/100`
+——溢出/重试路径完全没有被执行到。这不是无伤大雅的文档笔误:操作者跑这一步、
+看到 PASS、勾掉这一项,**溢出/重试路径就从未在硬件上跑过一次**——而这条路径
+正是本项目对"成功门通过、结果却是错的"这一特征失败模式(见 0.1、第 3 节候选
+溢出静默错误)的唯一硬件级防线。如果它没被触发过就上论文,这个防线形同虚设。
+
+改用 `-t 2`:每 task 扫 5000 个签名,期望候选数 ≈ 5000×0.1175 ≈ 588,超过
+400 的 cap,必然触发 `overflow=1` 且首轮收集不足,进而触发重试收敛。
+
 **Command:**
 ```bash
 cd hamming_mu
-./hamming_scan -n 10000 -k 100 -t 4 --mode C --load /tmp/sig10k.bin --dump-ids /tmp/ovf.ids
+./hamming_scan -n 10000 -k 100 -t 2 --mode C --load /tmp/sig10k.bin --dump-ids /tmp/ovf.ids
 cd -
 python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --ids /tmp/ovf.ids -k 100
 ```
 
-（只用 4 个 task,每 task 要扫 2500 个签名,候选数远超 `candCap = topK*4 = 400`,
-必然触发 kernel 侧的 `overflow=1`。）
+**Expected Output**(基于 `model_kernel.py` 独立复现,见下方"复现记录"——硬件
+上的具体计时会不同,但 overflow/重试/收敛 这条状态机路径应一致):
+- 首轮:每个 task 候选数打到 candCap=400 上限即截断,kernel 侧 `overflow=1`,
+  首轮 `collected` 明显小于 100(复现中为 67/100)
+- host 侧打印 `收集不足(67/100)-> coarseThresh 118 -> 精确阈值 109 重跑`
+  (109 是本次种子下的实际第 100 名距离,不是固定值——不同种子/数据会不同,
+  但"小于 118 且收敛后不再变化"这一形状应保持)
+- 重跑一次后收敛:`collected=100/100`,不再触发下一轮重试
+- 最终 `check-topk` **PASS**,返回的最大距离等于第 k 名距离
 
-**Expected Output:**
-- kernel 端打印 `[kernel] task0 ... overflow=1`
-- 最终 `check-topk` **PASS**
-- host 侧输出以下两种之一,都是正确行为:
-  - `注:发生过候选溢出,但结果仍有效(全部 d <= 精确阈值 N)` —— 溢出了但仍
-    收集够 k 个;merge 已按 exactThresh 过滤,这些 id 全部合格,无需重跑。
-  - `收集不足(x/100)-> coarseThresh 118 -> 精确阈值 N 重跑` —— 溢出丢掉了
-    太多合格项,重跑收敛到精确阈值后应能收集够。
+**关键判据是 `check-topk` PASS 且确实观察到 `overflow=1`**——本节的目的就是
+确认这条路径被执行到,如果 `overflow` 从未变成 1,即便 `check-topk` PASS,
+本节也没有测到它本该测的东西(见下方"为什么必须锁死这个配置")。
 
-**关键判据是 `check-topk` PASS**,而不是"有没有发生溢出"——溢出本身是预期
-会触发的诊断信息,不是失败信号。
+**复现记录(2026-08-12,`python hamming_mu/model_kernel.py` 之外,单独跑
+`hamming_mu/model_kernel.py` 内的 `scan_hist`/`merge_topk`/`run_with_retry`
++ `verify_host.gen_sigs`/`hamming_all`,参数与本节命令一致:n=10000, k=100,
+coarseThresh=118, candCap=topK*4=400,签名/query 与 `verify_host.py gen`
+默认 seed 一致):**
+```
+n=10000 k=100 coarseThresh=118 candCap=400 true kth dist=109
+P(d<=coarseThresh) empirical = 0.1160  期望候选数: t=4 时 290.0/task, t=2 时 580.0/task
+
+=== taskCount=4 ===
+per-task candCount: [292, 300, 284, 284]
+per-task overflow  : [0, 0, 0, 0]
+single-pass: overflow=0 collected=100/100 exactThresh=109
+run_with_retry: attempts=0 final_collected=100/100
+max returned distance=109  (kth=109)  OK=True
+
+=== taskCount=2 ===
+per-task candCount: [400, 400]
+per-task overflow  : [1, 1]
+single-pass: overflow=1 collected=67/100 exactThresh=109
+run_with_retry: attempts=1 final_collected=100/100
+max returned distance=109  (kth=109)  OK=True
+```
+`-t 4` 确认不溢出(与旧文档的断言相反);`-t 2` 确认溢出、收集不足 67/100、
+一次重试收敛到 exactThresh=109、最终 100/100、返回的最大距离等于第 100 名
+距离。这与审阅者报告的数字一致,独立复现通过。
+
+**为什么必须锁死这个配置(防止本节再次"测了个寂寞"):** 本节的参数
+(`n=10000 -k 100 -t 2`,配合代码写死的 `coarseThresh=118`、
+`candCap=topK*4`)是**特意选到刚好会溢出**的——每 task 期望候选数
+(≈588)明显超过 candCap(400)。这不是随手选的数字,是解出来的:
+`n/t × P(d≤coarseThresh) > candCap` 才会稳定触发溢出。**如果以后改了
+`n`、`k`、`t`、`coarseThresh` 的默认值,或者改了随机签名生成方式(改变
+了距离分布),这个不等式可能不再成立,本节会像本次修复前那样安静地
+"PASS 但没测到任何东西"。** 每次改动上述任一参数后,必须重新用
+`model_kernel.py` 按上面的方法验证 `overflow` 确实变成了 1,而不是想当然
+地认为旧参数还够用。
 
 **若失败:**
 - 若看到 `已在精确阈值 N 仍只收集到 x/100 -> candCap 太小`:说明重试已经收敛
@@ -308,7 +359,7 @@ python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --id
   `topK*4`)调大后重跑,重试循环本身不会再有帮助——这是设计上的"重试无用"
   分支,不是 bug。
 - 若 `check-topk` FAIL 但没有任何"收集不足"或"候选溢出"提示:先确认
-  `-t 4` 确实生效(看 host 打印的 `tasks=4`),不是意外用了默认 taskCount。
+  `-t 2` 确实生效(看 host 打印的 `tasks=2`),不是意外用了默认 taskCount。
 - 若 5 次重试后仍未收敛(`for (int attempt = 0; attempt < 5; ...)` 用尽):
   记录 `coarseThresh` 的变化轨迹,检查是否在两个 `exactThresh` 值之间震荡而非
   收敛——按设计它应该单调收敛到某个不动点。
@@ -340,10 +391,10 @@ cd hamming_mu && chmod +x sweep.sh && ./sweep.sh 10000000 2816
   **记录下来,不要强行套用 DRAN 的结论**
 
 **若失败:**
-- 若全是 `FAIL`,检查 grep 模式是否与 `hamming_scan.cpp` 第 200 行的输出格式
+- 若全是 `FAIL`,检查 grep 模式是否与 `hamming_scan.cpp` 第 337 行的输出格式
   一致
 - 若输出不是数字而是标点符号(`:`),说明 awk 字段索引错误 —— 应为 `$6`
-  而非 `$5`(参考 `hamming_scan.cpp` 第 200 行的输出格式分析)
+  而非 `$5`(参考 `hamming_scan.cpp` 第 337 行的输出格式分析)
 
 ### 6.2 用最优 batchSize 扫 numSub
 

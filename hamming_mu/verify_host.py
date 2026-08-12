@@ -94,6 +94,15 @@ def _self_test():
     assert len(duplicates) > 0, "应检测出重复"
     assert duplicates[0] == 2, "id 0 应出现 2 次"
 
+    # 9. 单个哨兵(sentinel)填充:唯一性检查放行(值唯一),但索引越界,
+    #    模拟 _cmd_check_topk 里的哨兵检查逻辑,验证它能在 ref[got] 之前拦截,
+    #    而不是让调用方看到 IndexError 的 traceback。
+    ref_dists9 = np.array([10, 20, 30, 40, 50], dtype=np.int32)
+    sentinel_ids = np.array([0, 1, 0xFFFFFFFF], dtype=np.uint32)  # 只有一个哨兵,值唯一
+    got_unique_count9 = len(set(sentinel_ids.tolist()))
+    assert got_unique_count9 == len(sentinel_ids), "单哨兵案例里 id 应各自唯一(不触发重复检查)"
+    assert int(sentinel_ids.max()) >= len(ref_dists9), "哨兵应越界,触发哨兵检查而非 ref[got]"
+
     print("self-test: ALL PASS")
 
 
@@ -140,6 +149,16 @@ def _cmd_check_topk(args):
         duplicates = {id_val: count for id_val, count in unique_ids.items() if count > 1}
         first_dup = sorted(duplicates.items())[0]
         print(f"FAIL: id {first_dup[0]} 出现 {first_dup[1]} 次 (期望唯一)")
+        sys.exit(1)
+    # 哨兵(sentinel)填充检查:设备收集不足 k 个真实 id 时,用 0xFFFFFFFF
+    # 填充剩余槽位。两个及以上哨兵会被上面的唯一性检查捕获(值相同即重复);
+    # 但恰好一个哨兵时该 id 本身是唯一的,不会被那个检查拦下 —— 若不在这里
+    # 提前拦截,下面 `ref[got]` 会因为索引越界抛 IndexError,而不是给出
+    # 清晰的 FAIL(这个函数是校验设备输出的服务器端关卡,不应该在这里崩溃)。
+    if got.size and int(got.max()) >= len(ref):
+        bad_id = int(got.max())
+        print(f"FAIL: id {bad_id} 越界 (>= len(ref)={len(ref)}) —— 设备只收集到"
+              f"不足 {args.k} 个真实 id,用哨兵(0xFFFFFFFF)填充了剩余槽位")
         sys.exit(1)
     # 平局可能使具体 id 不同,但每个返回 id 的距离必须 <= 第 k 名的距离
     kth = np.sort(ref)[args.k - 1]
