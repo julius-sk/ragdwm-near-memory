@@ -2,6 +2,27 @@
 
 ## 待服务器验证
 
+### Task 6 Step 2: 编译 hamming_scan_hist / hamming_merge_topk kernel
+
+**Command:**
+```bash
+cd hamming_mu && ./build.sh
+```
+
+**Expected Output:**
+- 编译无错误,无栈相关警告
+- `hamming_mu/mu_kernel/mu_kernel.mubin` 时间戳更新(确认是本次重新生成,不是旧产物)
+- `hamming_scan_hist` 与 `hamming_merge_topk` 两个符号都出现在产物里(可用
+  `$LLVM/bin/llvm-objdump -d hamming_mu/mu_kernel/mu_kernel.mubin | grep -E '<hamming_scan_hist>|<hamming_merge_topk>'` 核实)
+
+**若失败:**
+- 若报 `half_float 未声明` 之类错误,说明误加了 half 相关代码 —— 本项目为纯整数路径,`mu_hamming.cpp` 只应 `#include "mu/mu.hpp"`。
+- 若报参数个数超限(kernel 参数 <= 9):`hamming_scan_hist` 8 个、`hamming_merge_topk` 8 个,均在限内;若编译器报超限,先检查是否误传了额外参数,而不是删减已有参数。
+- 若报候选/直方图索引越界或结果与 `hamming_mu/model_kernel.py` 的 `scan_hist`/`merge_topk` 不一致:以 model_kernel.py 为准逐行比对,尤其是 `cand[2j]=id, cand[2j+1]=dist` 的交错存储、`candCap*2` 的分片大小、以及 merge 里 `dist <= exactThresh` 的过滤条件 —— 这三处是已复现过的静默错误点。
+- 若报栈溢出相关警告:`hamming_merge_topk` 唯一的大局部数组是 `uint32_t total[BITS+1]`(257*4=1028 B,远低于 64 KB/task 栈限制),先确认没有其他新增的局部数组吃掉了栈空间。
+
+---
+
 ### Step 2: 运行环境校验
 
 **Command:**
