@@ -1623,8 +1623,13 @@ git commit -m "feat(hamming): counting-sort top-k kernels with overflow detectio
         if (batchSize > 0) scanExec->setBatchSize(batchSize);
         if (spread) scanExec->setLocalityMode(pxl::LocalityMode::SpreadMode);
 
-        scanExec->execute(sigs, query, (uint64_t)numSigs, dists);
-        scanExec->synchronize();                       // warmup
+        // warmup —— 返回值必须检查。一次静默失败的 warmup 会让后面所有计时
+        // 建立在"kernel 其实没跑起来"的基础上,而计时循环自己是检查了的,
+        // 于是错误会以"数字异常好看"的形式出现,最难察觉。
+        if (scanExec->execute(sigs, query, (uint64_t)numSigs, dists) != pxl::Result::Success)
+        { printf("warmup execute failed\n"); return 1; }
+        if (scanExec->synchronize() != pxl::Result::Success)
+        { printf("warmup synchronize failed\n"); return 1; }
 
         for (int r = 0; r < reps; r++)
         {
