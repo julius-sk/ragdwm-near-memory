@@ -208,7 +208,7 @@ int main(int argc, char* argv[])
     auto job = numSub > 0 ? context->createJob(numSub) : context->createJob();
     if (job->load(module) != pxl::Result::Success) { printf("job load failed\n"); return 1; }
 
-    double best = 1e30, bestScan = 1e30, bestMerge = 1e30;
+    double best = 1e30, bestScan = 1e30, bestMerge = 1e30, readMs = 0.0;
     size_t outBytes = 0;
 
     if (!modeC)
@@ -218,8 +218,13 @@ int main(int argc, char* argv[])
         if (batchSize > 0) scanExec->setBatchSize(batchSize);
         if (spread) scanExec->setLocalityMode(pxl::LocalityMode::SpreadMode);
 
-        scanExec->execute(sigs, query, (uint64_t)numSigs, dists);
-        scanExec->synchronize();                       // warmup
+        // warmup —— 返回值必须检查。一次静默失败的 warmup 会让后面所有计时
+        // 建立在"kernel 其实没跑起来"的基础上,而计时循环自己是检查了的,
+        // 于是错误会以"数字异常好看"的形式出现,最难察觉。
+        if (scanExec->execute(sigs, query, (uint64_t)numSigs, dists) != pxl::Result::Success)
+        { printf("warmup execute failed\n"); return 1; }
+        if (scanExec->synchronize() != pxl::Result::Success)
+        { printf("warmup synchronize failed\n"); return 1; }
 
         for (int r = 0; r < reps; r++)
         {
@@ -234,7 +239,11 @@ int main(int argc, char* argv[])
         }
         bestScan = best;
         outBytes = numSigs * sizeof(int32_t);
+        // 读结果之前必须 flush(失效方向)——单独计时,mode C 的等价读在重试
+        // 循环内部,那里的计时没有单一有意义的数值,故只在 mode B 报告本行。
+        auto tRead = std::chrono::steady_clock::now();
         pxl::flushHostCache(dists, outBytes);
+        readMs = msSince(tRead);
     }
     else
     {
@@ -323,6 +332,7 @@ int main(int argc, char* argv[])
     printf("  合计每查询              : %8.3f ms\n", best);
     printf("  扫描有效带宽            : %8.1f GB/s   (上限 268)\n",
            scannedGB / (bestScan / 1e3));
+    if (!modeC) printf("  结果回传 flush          : %8.3f ms\n", readMs);
     printf("\n--- 一次性初始化(稳态不重复)---\n");
     printf("  flushHostCache          : %8.1f ms\n", flushMs);
     printf("  preloadMemory           : %8.1f ms\n", preMs);
