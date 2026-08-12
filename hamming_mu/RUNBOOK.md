@@ -190,3 +190,104 @@ cd hamming_mu && BEST_B=<上一步的最优值> ./sweep.sh 10000000 2816
 - 可选:计算有效带宽 = (scannedGB) / (min_ms / 1000) GB/s,其中 scannedGB 在 hamming_scan.cpp 输出中显示
 
 **待办(需服务器执行后回填):** batchSize 和 numSub 的实测值与最优值选择。
+
+---
+
+### Task 7 Step 2: 编译 host 驱动的 C 模式(hamming_scan_hist / hamming_merge_topk 调用路径)
+
+**Command:**
+```bash
+cd hamming_mu && ./build.sh
+```
+
+**Expected Output:**
+- 编译无错误
+- `ls -la hamming_mu/hamming_scan` 存在且为本次新产物(时间戳更新)
+- `ls -la hamming_mu/mu_kernel/mu_kernel.mubin` 存在(Task 6 的 kernel,未改动)
+
+**若失败:**
+- 报参数不匹配 / 找不到符号:确认 `hamming_scan.cpp` 里 `module->createFunction("hamming_scan_hist")` / `("hamming_merge_topk")` 的名字与 `mu_kernel/mu_hamming.cpp` 里 `MU_KERNEL_ADD(...)` 完全一致,且 `histExec->execute(...)` / `mergeExec->execute(...)` 的参数顺序、个数与类型与 kernel 签名一致 —— `hamming_scan_hist(sigs, query, numSigs, coarseThresh, candCap, outHist, outCand, outMeta)` 8 个参数,`hamming_merge_topk(hist, cand, meta, taskCount, candCap, topK, dists, outIds)` 8 个参数。
+- 报 pxl 相关类型 / 返回值不匹配:对照 `dran_mu/dran_retrieve.cpp`(已知可用的同类 host 驱动)核实 `pxl::MemoryStatus`、`pxl::Result`、`job->buildMap`、`execute`/`synchronize` 的用法,不要自行猜测 API。
+- 报 signed/unsigned 比较警告:`ids[topK + 2] < (uint32_t)topK` 之类的比较里 `topK` 已显式转 `uint32_t`,若警告指向别处,先看是不是新增代码里漏转了。
+
+---
+
+### Task 7 Step 3: 小规模验证 top-k 正确(mode C 端到端)
+
+**Command:**
+```bash
+cd hamming_mu
+./hamming_scan -n 10000 -k 100 -t 64 --mode C --load /tmp/sig10k.bin --dump-ids /tmp/dev10k.ids
+cd -
+python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --ids /tmp/dev10k.ids -k 100
+```
+
+（若 `/tmp/sig10k.bin` 和 `.query`/`.dists.npy` 还不存在，先用 Task 4 的
+`python hamming_mu/verify_host.py gen -n 10000 -o /tmp/sig10k.bin` 生成。）
+
+**Expected Output:**
+```
+PASS: 100 个 id 距离全部 <= 第k名(...)
+```
+
+**如何解读 / 平局语义:** 判据是"返回的每个 id 的距离必须 <= 第 k 名的距离"，
+而**不是** id 集合与 numpy argsort 完全相同——计数排序与 numpy 在平局时选的
+具体 id 可以不同，这不是错误。`check-topk` 同时检查数量、距离上界、id 唯一性
+三项；三项皆过才算 PASS。
+
+**若失败,按此顺序诊断:**
+1. 数量不足(collected < k)但没有触发重试/警告 → 检查重试循环里
+   `ids[topK]` / `ids[topK+1]` / `ids[topK+2]` 三个状态槽的索引是否与
+   `mu_hamming.cpp` 里 `outIds[topK]=exactThresh`、`outIds[topK+1]=anyOverflow`、
+   `outIds[topK+2]=collected` 完全对应——错位是最容易犯且最隐蔽的错误。
+2. 结果每次运行不同 → 读 `ids` 之前是否每次都调用了
+   `pxl::flushHostCache(ids, (topK+3)*sizeof(uint32_t))`；重试循环内、循环外、
+   dump 之前都需要各自的 flush，漏一处就会读到设备写入前的陈旧数据。
+3. 距离超过第 k 名 → 检查 `hamming_merge_topk` 里 `dist <= exactThresh` 的过滤
+   条件是否被误删或改动（这是 Task 2b 复现过的静默错误点，host 侧不应改动
+   kernel，但要确认 host 传给 kernel 的 `topK`/`candCap`/`taskCount` 参数顺序
+   没有传错导致 kernel 侧算出错误的 exactThresh）。
+
+**待办(需服务器执行后回填):** 实际 PASS/FAIL 输出、scan/merge 分别计时、
+是否触发过重试。
+
+---
+
+### Task 7 Step 4: 验证候选溢出路径真的会触发并自愈
+
+**Command:**
+```bash
+cd hamming_mu
+./hamming_scan -n 10000 -k 100 -t 4 --mode C --load /tmp/sig10k.bin --dump-ids /tmp/ovf.ids
+cd -
+python hamming_mu/verify_host.py check-topk --ref /tmp/sig10k.bin.dists.npy --ids /tmp/ovf.ids -k 100
+```
+
+（只用 4 个 task，每 task 要扫 2500 个签名，候选数远超 `candCap = topK*4 = 400`，
+必然触发 kernel 侧的 `overflow=1`。）
+
+**Expected Output:**
+- kernel 端打印 `[kernel] task0 ... overflow=1`
+- 最终 `check-topk` **PASS**
+- host 侧输出以下两种之一，都是正确行为：
+  - `注:发生过候选溢出,但结果仍有效(全部 d <= 精确阈值 N)` ——
+    溢出了但仍收集够 k 个；merge 已按 exactThresh 过滤，这些 id 全部合格，无需重跑。
+  - `收集不足(x/100)-> coarseThresh 118 -> 精确阈值 N 重跑` ——
+    溢出丢掉了太多合格项，重跑收敛到精确阈值后应能收集够。
+
+**关键判据是 `check-topk` PASS**，而不是"有没有发生溢出"——溢出本身是预期
+会触发的诊断信息，不是失败信号。
+
+**若失败:**
+- 若看到 `已在精确阈值 N 仍只收集到 x/100 -> candCap 太小`：说明重试已经收敛
+  到精确阈值但 `candCap` 仍不够大，需要在 host 侧把 `candCap`（当前
+  `topK*4`）调大后重跑，重试循环本身不会再有帮助——这是设计上的"重试无用"
+  分支，不是 bug。
+- 若 `check-topk` FAIL 但没有任何"收集不足"或"候选溢出"提示：先确认
+  `-t 4` 确实生效（看 host 打印的 `tasks=4`），不是意外用了默认 taskCount。
+- 若 5 次重试后仍未收敛（`for (int attempt = 0; attempt < 5; ...)` 用尽）：
+  记录 `coarseThresh` 的变化轨迹，检查是否在两个 `exactThresh` 值之间震荡而非
+  收敛——按设计它应该单调收敛到某个不动点。
+
+**待办(需服务器执行后回填):** 是否观察到 overflow、host 侧走了哪条分支、
+`check-topk` 的最终 PASS/FAIL、以及若调大 candCap 重试过的话新的结果。
