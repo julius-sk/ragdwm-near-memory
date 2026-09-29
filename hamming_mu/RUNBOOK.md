@@ -528,3 +528,91 @@ cd hamming_mu && sed -i '/-DPOPCNT_SWAR/d' mu_kernel/CMakeLists.txt && ./build.s
 A 组的"dev 机 provisional"标注按第 7.1 节说明已替换或改写,"诚实边界"章节的
 机器一致性警告段落已按实际情况更新或删除,然后把整个 `hamming_mu/` 目录传回
 开发机(或直接把改动过的 `RESULTS.md` 拷回),供后续整理与提交。
+
+---
+
+## 10. Roofline 对照 —— 判定"近内存这条路还要不要继续"
+
+第 5~8 节回答的是"设备比主机快还是慢",这一节回答一个不同的、更靠前的问题:
+
+> **51.8 GB/s(主机)和 35.3 GB/s(设备)分别离各自的硬件极限有多远?**
+
+两个数都可能是"实现上限"而不是"硬件上限",而项目走向完全取决于是哪一种:
+
+- 若设备已贴着自己的天花板、主机还差得远 —— **近内存这条路应当结束**,再优化
+  kernel 也追不上一个写对了的主机基线。
+- 若设备离自己的天花板还远 —— 差距在实现,值得继续投入。
+
+**RESULTS.md 里那行 objdump 观察是这一节的直接动机:** 主机侧只有 4 条标量
+`POPCNT`、0 条 `VPOPCNTDQ`,而双路 Granite Rapids 的内存带宽在 500 GB/s 量级。
+51.8 GB/s 大约只是可用带宽的 10%,所以**主机基线自己就没跑满**。
+
+### 10.1 主机侧 roofline(不需要 SDK,可独立运行)
+
+```bash
+gcc -O3 -march=native -fopenmp -o bench_roofline bench_roofline.c
+# 若 -march=native 未启用 vpopcntdq:
+# gcc -O3 -mavx512f -mavx512vpopcntdq -mtune=native -fopenmp -o bench_roofline bench_roofline.c
+
+./bench_roofline -n 100000000 -k 500 --reps 5
+```
+
+程序自己会做两件必须做的事:
+
+1. **正确性:** 标量扫描与分块扫描的 top-k 距离必须完全一致,不一致直接非零退出
+   并拒绝报告性能。一个快但错的基线看起来就是赢。
+2. **向量化是否真的发生:** 程序结束时会提示你运行
+
+   ```bash
+   objdump -d bench_roofline | grep -c vpopcnt
+   ```
+
+   **计数为 0 就说明编译器没有向量化,分块那一行的数字不能用作结论。** 这时
+   需要手写 intrinsics,或换 clang 再试一次。
+
+输出三行:纯顺序读(内存 roofline)、标量扫描(现有实现的结构)、分块扫描
+(可向量化),以及各自占 roofline 的百分比。
+
+### 10.2 设备侧 roofline
+
+`mu_roofline.cpp` 提供两个探针,与 `hamming_scan_dists` **读同样的字节、同样的
+顺序、同样的 task 划分**,但不做 popcount:
+
+- `hamming_bw_read` —— 只读,每 task 写一个 uint64。纯读带宽上限。
+- `hamming_bw_readwrite` —— 额外写 N 个 int32,输出量与 B 组一致。
+
+两者之差就是 B 组那 400 MB(N=100M 时)输出写入的代价 —— 这多半就是 B 组
+27.9 GB/s 与 C 组 35.3 GB/s 差距的来源,一比即知,不必猜。
+
+```bash
+./build.sh                       # mu_roofline.cpp 已加入 mu_kernel/CMakeLists.txt 的 src
+./hamming_scan -n 100000000 -t 2816 -b 16 -s 8 --mode R --reps 5
+```
+
+**`--mode R` 是纯加法式改动**,B/C 两条已验证的路径一行未动(arena 布局沿用
+B 组,因为 `modeC` 在 R 模式下仍为 false)。
+
+输出里的 `校验 XOR 折叠` **为 0 说明 kernel 可能根本没跑** —— 随机签名折叠出
+全零的概率可以忽略,所以这是"kernel 确实执行过"的有效证据,不要跳过。
+
+### 10.3 怎么下结论
+
+把四个数填进这张表(N 必须都是 100000000,与 RESULTS.md 的设备数字口径一致):
+
+| | 带宽 | 占自身 roofline |
+|---|---|---|
+| 主机 roofline(纯读) | `<填写>` | 100% |
+| 主机扫描(标量,现有) | 51.8 GB/s(已测) | `<填写>` |
+| 主机扫描(分块/向量化) | `<填写>` | `<填写>` |
+| 设备 roofline(纯读) | `<填写>` | 100% |
+| 设备扫描 B / C | 27.9 / 35.3 GB/s(已测) | `<填写>` |
+
+**判据(在跑之前就定好,不许事后调整):**
+
+1. **若"主机扫描(向量化)" > "设备 roofline"** —— 结束近内存方向。主机只要
+   写对就越过了设备的硬件极限,任何 kernel 优化都无法改变结论。
+2. **若"设备扫描 C ÷ 设备 roofline" > 85%** —— 结束。设备已贴着自己的天花板。
+3. **否则** —— 差距在实现,继续。此时下一步是把 kernel 的缺口定位到具体原因
+   (访存模式、batchSize、numSub、指令调度),而不是再泛泛地"优化"。
+
+三条判据里任何一条成立都足以做决定,不需要三条都满足。

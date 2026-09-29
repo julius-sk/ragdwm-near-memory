@@ -46,6 +46,23 @@ else()
     message(STATUS "  gcc -O3 -march=native -fopenmp -o bench_host_c bench_host_c.c")
 endif()
 
+# --- 主机侧 roofline 对照 -----------------------------------------------
+# 回答"51.8 GB/s 是硬上限还是实现上限"。同样可选,同样不许拖垮设备侧构建。
+# -O3 -march=native 是必需的:分块扫描要靠编译器自动向量化成 VPOPCNTDQ,
+# 少了 -march=native 就退回标量 POPCNT,那一行数字就不能用作结论。
+if (OpenMP_C_FOUND)
+    add_executable(bench_roofline bench_roofline.c)
+    target_link_libraries(bench_roofline PRIVATE OpenMP::OpenMP_C)
+    if (CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(bench_roofline PRIVATE -O3 -march=native)
+    endif()
+    install(TARGETS bench_roofline RUNTIME DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
+    message(STATUS "bench_roofline: OpenMP found -> will build")
+else()
+    message(STATUS "bench_roofline: OpenMP NOT found -> skipped. 手工编译:")
+    message(STATUS "  gcc -O3 -march=native -fopenmp -o bench_roofline bench_roofline.c")
+endif()
+
 include(ExternalProject)
 ExternalProject_Add(build_mu_${PROJECT_NAME}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mu_kernel

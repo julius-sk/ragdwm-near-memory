@@ -1,0 +1,3 @@
+# solab-h1 是 Linux。CRLF 的 shebang 会让脚本报
+# "cannot execute: required file not found" —— build.sh 已经被这个坑过一次。
+*.sh text eol=lf

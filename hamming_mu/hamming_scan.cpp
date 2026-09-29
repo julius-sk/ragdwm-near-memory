@@ -101,9 +101,12 @@ int main(int argc, char* argv[])
     }
 
     const bool modeC = (strcmp(mode, "C") == 0);
-    if (!modeC && strcmp(mode, "B") != 0)
+    // mode R —— 带宽 roofline 探针。arena 布局与 B 组完全相同(modeC 保持 false),
+    // 所以下面所有 `modeC ? ... : ...` 都自动给出 B 的布局,无需另加分支。
+    const bool modeR = (strcmp(mode, "R") == 0);
+    if (!modeC && !modeR && strcmp(mode, "B") != 0)
     {
-        printf("mode 必须是 B 或 C\n");
+        printf("mode 必须是 B、C 或 R\n");
         return 1;
     }
     // 粗阈值:随机 256 位签名的距离集中在 128 附近,取 118 可覆盖 topK
@@ -213,6 +216,78 @@ int main(int argc, char* argv[])
     double best = 1e30, bestScan = 1e30, bestMerge = 1e30, readMs = 0.0;
     size_t outBytes = 0;
 
+    if (modeR)
+    {
+        // ---- 带宽 roofline:读同样的字节、同样的顺序、同样的 task 划分,
+        //      但不做 popcount。任何真实扫描 kernel 都不可能快过它。 ----
+        if (numSigs * sizeof(int32_t) < (size_t)taskCount * sizeof(uint64_t))
+        {
+            printf("N 太小:dists 区放不下 %d 个 uint64 累加器\n", taskCount);
+            pxl::releaseMemory(arena);
+            return 1;
+        }
+        auto* outAcc = reinterpret_cast<uint64_t*>(dists);
+
+        auto* rdFunc = module->createFunction("hamming_bw_read");
+        auto* rwFunc = module->createFunction("hamming_bw_readwrite");
+        auto rdExec = job->buildMap(rdFunc, taskCount);
+        auto rwExec = job->buildMap(rwFunc, taskCount);
+        if (batchSize > 0) { rdExec->setBatchSize(batchSize); rwExec->setBatchSize(batchSize); }
+        if (spread) { rdExec->setLocalityMode(pxl::LocalityMode::SpreadMode);
+                      rwExec->setLocalityMode(pxl::LocalityMode::SpreadMode); }
+
+        // warmup 的返回值必须检查 —— 一次静默失败的 warmup 会让后面的计时
+        // 建立在"kernel 其实没跑起来"上,症状是带宽数字好得离谱。
+        if (rdExec->execute(sigs, (uint64_t)numSigs, outAcc) != pxl::Result::Success ||
+            rdExec->synchronize() != pxl::Result::Success)
+        { printf("bw_read warmup failed\n"); pxl::releaseMemory(arena); return 1; }
+        if (rwExec->execute(sigs, (uint64_t)numSigs, dists) != pxl::Result::Success ||
+            rwExec->synchronize() != pxl::Result::Success)
+        { printf("bw_readwrite warmup failed\n"); pxl::releaseMemory(arena); return 1; }
+
+        double bestRd = 1e30, bestRw = 1e30;
+        for (int r = 0; r < reps; r++)
+        {
+            auto t0 = std::chrono::steady_clock::now();
+            if (rdExec->execute(sigs, (uint64_t)numSigs, outAcc) != pxl::Result::Success ||
+                rdExec->synchronize() != pxl::Result::Success)
+            { printf("bw_read execute failed\n"); pxl::releaseMemory(arena); return 1; }
+            const double a = msSince(t0);
+            if (a < bestRd) bestRd = a;
+
+            auto t1 = std::chrono::steady_clock::now();
+            if (rwExec->execute(sigs, (uint64_t)numSigs, dists) != pxl::Result::Success ||
+                rwExec->synchronize() != pxl::Result::Success)
+            { printf("bw_readwrite execute failed\n"); pxl::releaseMemory(arena); return 1; }
+            const double b = msSince(t1);
+            if (b < bestRw) bestRw = b;
+
+            printf("  rep %d: read %.3f ms   read+write %.3f ms\n", r, a, b);
+        }
+
+        // 累加器必须被读一次,否则无法证明 kernel 真的跑了。随机签名折叠出全零
+        // 的概率可以忽略,所以它是一个有效的"kernel 确实执行过"的证据。
+        pxl::flushHostCache(outAcc, (size_t)taskCount * sizeof(uint64_t));
+        uint64_t fold = 0;
+        for (int t = 0; t < taskCount; t++) fold ^= outAcc[t];
+
+        const double gbRd = (double)sigBytes / 1e9 / (bestRd / 1e3);
+        const double gbRw = (double)sigBytes / 1e9 / (bestRw / 1e3);
+        printf("\n=== MX1P 带宽 roofline  N=%zu  %.3f GB  t=%d b=%d ===\n",
+               numSigs, sigBytes / 1e9, taskCount, batchSize);
+        printf("  纯读 (roofline)         : %8.3f ms   %6.1f GB/s\n", bestRd, gbRd);
+        printf("  读+写 N 个 int32 (= B组): %8.3f ms   %6.1f GB/s\n", bestRw, gbRw);
+        printf("  输出写入的代价          : %8.3f ms   (%.1f%%)\n",
+               bestRw - bestRd, 100.0 * (bestRw - bestRd) / bestRd);
+        printf("  校验 XOR 折叠           : 0x%016llx  (为 0 说明 kernel 可能没跑)\n",
+               (unsigned long long)fold);
+        printf("\n  怎么读这张表:把 RESULTS.md 里的设备扫描带宽除以上面的纯读带宽。\n");
+        printf("  接近 100%% -> 设备已到硬件极限,优化 kernel 无用;\n");
+        printf("  明显偏低   -> 差距在实现,值得继续投入。\n");
+
+        pxl::releaseMemory(arena);
+        return 0;
+    }
     if (!modeC)
     {
         auto* scanFunc = module->createFunction("hamming_scan_dists");

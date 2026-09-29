@@ -53,6 +53,7 @@ set(linker ${MU_LIB_PATH}/script/mu_linker.ld)
 
 set(src
     mu_hamming.cpp
+    mu_roofline.cpp
 )
 
 add_executable(${output} ${src})

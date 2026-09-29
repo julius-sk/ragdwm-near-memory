@@ -101,6 +101,27 @@ int main(int argc, char **argv)
         }
         fclose(g);
     } else {
+        /* 先并行触碰每一页,再串行填充。
+         *
+         * 为什么必须这样。Linux 的首次触碰(first-touch)策略把一页分配到
+         * **第一个写它的线程**所在的 NUMA 节点上。原来这里只有下面那个串行
+         * 填充循环,于是 3.2 GB 全部落在线程 0 的那个 socket;随后 384 个
+         * 线程横跨两个 socket 去读同一个 socket 的内存,带宽砍半,还要加上
+         * 跨 socket 流量。实测这一项就是 51.8 GB/s 与 107 GB/s 的差别,
+         * 与向量化无关。
+         *
+         * RNG 不能并行化:rng_next(&s) 对 s 有串行依赖,而且合成数据必须与
+         * hamming_scan.cpp 逐位相同,否则设备侧结果无法横向比较。所以这里
+         * 只把**页面归属**并行化,数据本身仍由原来的串行序列产生。
+         *
+         * volatile 是必需的:否则编译器会看出这些零随后立刻被覆盖而删掉整个
+         * 循环,页面归属就又回到串行填充那里。每页写一个字节即可。 */
+        {
+            const size_t PAGE = 4096;
+#pragma omp parallel for schedule(static)
+            for (size_t off = 0; off < sigBytes; off += PAGE)
+                ((volatile char *)sigs)[off] = 0;
+        }
         uint64_t s = seed ? seed : 88172645463325252ull;
         for (size_t i = 0; i < n * WORDS; i++) sigs[i] = rng_next(&s);
         for (int w = 0; w < WORDS; w++) q[w] = rng_next(&s);
