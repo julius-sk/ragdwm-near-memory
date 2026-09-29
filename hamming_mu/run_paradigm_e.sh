@@ -24,7 +24,9 @@ TASKS="${TASKS:-2816}"
 BATCH="${BATCH:-16}"
 NUMSUB="${NUMSUB:-8}"
 REPS="${REPS:-5}"
-K="${K:-100}"
+# 三个工具的默认 topK 都是 500,8 月的设备数字也是在默认值下取的。改动它会让
+# 主机侧和设备侧的 top-k 维护成本不再可比 —— 除非同时改,否则别动。
+K="${K:-500}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
