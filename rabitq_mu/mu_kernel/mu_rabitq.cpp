@@ -324,8 +324,136 @@ void rabitq_merge(const uint32_t* res, uint64_t numTasks, uint64_t k, uint32_t* 
     }
 }
 
+// ===========================================================================
+// G 模式:全局阈值 τ 的两遍扫描 —— 设备上真正该用的两阶段做法
+//
+// T 模式(rabitq_topk)让每个 task 各自维护堆,是 FAISS 循环的直接并行化。但 2816 个
+// task 时每个 task 只分到很少的向量,堆要先填满 k 个才有阈值,结果几乎全部被精算:
+// FiQA(5.7 万条)上精算 90%,第二阶段字节是第一阶段的 2.3 倍。
+// G 模式先求全局 τ = 所有向量上界 ub = est + f_error*g 中第 k 小的值:若误差界成立,
+// 至少 k 条的真实距离 <= τ,下界 >= τ 的向量不可能进 top-k。参考模型在 FiQA 上
+// 精算 0.71%(FAISS 单线程顺序扫描是 0.79%),召回不变。
+//   rabitq_bounds  每 task:写 lb[i];本段最小的 k 个 ub -> outUB
+//   rabitq_tau     单 task:numTasks x k 个 ub 中第 k 小 -> outTau[0]
+//   rabitq_refine  每 task:只读 lb(4 B/条),lb < min(τ, 本地堆最大值) 才精算
+// 之后用 rabitq_merge 归并。与 rabitq_ref.two_stage_global 一字不差。
+// ===========================================================================
+namespace
+{
+// buf 中保留最小的 k 个(未满为 inf);替换第一个最大值 —— 同 rabitq_ref._smallest_k_max
+inline void keepSmallest(float* buf, uint32_t k, float v)
+{
+    uint32_t jmax = 0;
+    for (uint32_t j = 1; j < k; j++)
+        if (buf[j] > buf[jmax]) jmax = j;
+    if (v < buf[jmax]) buf[jmax] = v;
+}
+}  // namespace
+
+void rabitq_bounds(const uint64_t* signs, const float* fac1, const uint64_t* qblock,
+                   uint64_t numSigs, float* outLB, float* outUB)
+{
+    Query q;
+    const uint32_t taskIdx = mu::getTaskIdx();
+    if (!loadQuery(qblock, q))
+    {
+        if (taskIdx == 0) mu::hostPrintf("[kernel] bad qblock header\n");
+        return;
+    }
+    const uint32_t k = q.h.k;
+    float buf[K_MAX];
+    const float INF = __builtin_inff();
+    for (uint32_t j = 0; j < k; j++) buf[j] = INF;
+
+    uint64_t begin, end;
+    myRange(numSigs, begin, end);
+    for (uint64_t i = begin; i < end; i++)
+    {
+        uint64_t dot, pc;
+        const float* f1 = fac1 + 3 * i;
+        stage1Ints(signs + i * q.h.words, q, dot, pc);
+        const float est = stage1Est(dot, pc, f1, q.h);
+        const float adj = f1[2] * q.h.gError;
+        float lb = est - adj;
+        if (lb < 0.0f) lb = 0.0f;
+        outLB[i] = lb;
+        keepSmallest(buf, k, est + adj);
+    }
+    float* my = outUB + static_cast<uint64_t>(taskIdx) * k;
+    for (uint32_t j = 0; j < k; j++) my[j] = buf[j];
+}
+
+void rabitq_tau(const float* ub, uint64_t numTasks, uint64_t k, float* outTau)
+{
+    if (mu::getTaskIdx() != 0) return;
+    if (k == 0 || k > K_MAX) { mu::hostPrintf("[kernel] tau: bad k\n"); return; }
+    float buf[K_MAX];
+    const float INF = __builtin_inff();
+    for (uint64_t j = 0; j < k; j++) buf[j] = INF;
+    const uint64_t total = numTasks * k;
+    for (uint64_t e = 0; e < total; e++) keepSmallest(buf, (uint32_t)k, ub[e]);
+    float tau = buf[0];
+    for (uint64_t j = 1; j < k; j++)
+        if (buf[j] > tau) tau = buf[j];
+    outTau[0] = tau;
+    mu::hostPrintf("[kernel] tau = 0x%08x\n", (unsigned)floatBits(tau));
+}
+
+void rabitq_refine(const uint64_t* signs, const uint8_t* excode, const float* facx,
+                   const uint64_t* qblock, const float* lb, const float* tauPtr,
+                   uint64_t numSigs, uint32_t* outRes, uint32_t* outStats)
+{
+    Query q;
+    const uint32_t taskIdx = mu::getTaskIdx();
+    if (!loadQuery(qblock, q) || q.h.exBits == 0)
+    {
+        if (taskIdx == 0) mu::hostPrintf("[kernel] bad qblock or exBits==0\n");
+        return;
+    }
+    const uint32_t k = q.h.k;
+    const float tau = tauPtr[0];
+    float hd[K_MAX];
+    uint32_t hi[K_MAX];
+    const float INF = __builtin_inff();
+    for (uint32_t j = 0; j < k; j++) { hd[j] = INF; hi[j] = NONE; }
+
+    uint64_t begin, end;
+    myRange(numSigs, begin, end);
+    uint32_t refined = 0;
+    for (uint64_t i = begin; i < end; i++)
+    {
+        float hmax = hd[0];
+        uint32_t jmax = 0;
+        for (uint32_t j = 1; j < k; j++)
+            if (hd[j] > hmax) { hmax = hd[j]; jmax = j; }
+        const float thr = (tau < hmax) ? tau : hmax;
+        if (lb[i] < thr)
+        {
+            refined++;
+            const float full = stage2Full(signs + i * q.h.words, excode + i * q.h.exBytes,
+                                          facx + 2 * i, q);
+            if (full < hmax)
+            {
+                hd[jmax] = full;
+                hi[jmax] = static_cast<uint32_t>(i);
+            }
+        }
+    }
+    uint32_t* my = outRes + static_cast<uint64_t>(taskIdx) * k * 2;
+    for (uint32_t j = 0; j < k; j++)
+    {
+        my[2 * j] = floatBits(hd[j]);
+        my[2 * j + 1] = hi[j];
+    }
+    outStats[2 * taskIdx] = refined;
+    outStats[2 * taskIdx + 1] = static_cast<uint32_t>(end - begin);
+}
+
 MU_KERNEL_ADD(rabitq_ints);
 MU_KERNEL_ADD(rabitq_est1);
 MU_KERNEL_ADD(rabitq_full);
 MU_KERNEL_ADD(rabitq_topk);
 MU_KERNEL_ADD(rabitq_merge);
+MU_KERNEL_ADD(rabitq_bounds);
+MU_KERNEL_ADD(rabitq_tau);
+MU_KERNEL_ADD(rabitq_refine);

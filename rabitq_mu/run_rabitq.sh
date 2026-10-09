@@ -17,6 +17,7 @@
 #   I 对、E 不对 -> 第一阶段的标量浮点在设备上算得不一样
 #   E 对、F 不对 -> 第二阶段的 d 维标量浮点循环(DRAN 记录过 -O3 下算错)
 #   F 对、T 不对 -> 堆、阈值、分块或归并逻辑
+#   T 对、G 不对 -> 上界/τ/下界数组或第二遍的读法
 # ---------------------------------------------------------------------------
 set -uo pipefail
 cd "$(dirname "$0")"
@@ -47,8 +48,8 @@ SCAN=(./rabitq_scan -t "$TASKS" -b "$BATCH" -s "$NUMSUB")
 # ---- 正确性:每个语料 x 每个位数,按 I -> E -> F -> T ----
 check() {   # check <prefix> <nb> <tag>
     local P="$1" NB="$2" TAG="$3"
-    for M in I E F T; do
-        [ "$M" = F ] && [ "$NB" -eq 1 ] && continue
+    for M in I E F T G; do
+        { [ "$M" = F ] || [ "$M" = G ]; } && [ "$NB" -eq 1 ] && continue
         local D="$OUT/${TAG}_${M}.bin"
         "${SCAN[@]}" --data "$P" --mode "$M" --nq "$NQ" --reps 1 --dump "$D" \
             > "$OUT/${TAG}_${M}.txt" 2>&1 || { log "!! $TAG mode $M 执行失败(见 $OUT/${TAG}_${M}.txt)"; return 1; }

@@ -141,12 +141,18 @@ def code_values(signs, excode, d, ex_bits):
     return (sb << ex_bits) + ex
 
 
-def stage2_full(signs, excode, facx, qblk, d):
+def stage2_full(signs, excode, facx, qblk, d, chunk=1 << 18):
+    """分块解码:一次解码全部码要 N x d 个 int64(884 万 x 384 时约 27 GB)。"""
     ex_bits = qblk["ex_bits"]
-    vals = code_values(signs, excode, d, ex_bits).astype(np.float64)
-    ex_ip = (vals + float(qblk["cb"])) @ qblk["rq"].astype(np.float64)
-    dist = float(qblk["qr_to_c"]) + facx[:, 0].astype(np.float64) + facx[:, 1] * ex_ip
-    return np.maximum(0.0, dist).astype(np.float32)
+    rq = qblk["rq"].astype(np.float64)
+    out = np.empty(signs.shape[0], np.float32)
+    for s in range(0, signs.shape[0], chunk):
+        e = min(s + chunk, signs.shape[0])
+        vals = code_values(signs[s:e], excode[s:e], d, ex_bits).astype(np.float64)
+        ex_ip = (vals + float(qblk["cb"])) @ rq
+        dist = float(qblk["qr_to_c"]) + facx[s:e, 0].astype(np.float64) + facx[s:e, 1] * ex_ip
+        out[s:e] = np.maximum(0.0, dist)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +202,91 @@ def two_stage(est1, full, ferr, g, k, task_count):
         b, e = task_range(n, T, t)
         refined[t] = _scan_range(e1, fu, fe, np.float32(g), b, e, k, res_d[t], res_i[t])
     return res_d, res_i, refined, merge(res_d, res_i, k)
+
+
+# ---------------------------------------------------------------------------
+# G 模式:全局阈值 τ 的两遍扫描(设备上真正该用的)
+#
+# 为什么。上面的 two_stage 让每个 task 各自维护堆 —— 这是 FAISS 循环的直接并行化,
+# 但 2816 个 task 时每个 task 只分到很少的向量,堆要先填满 k 个才有阈值,结果几乎
+# 全部被精算:FiQA(5.7 万条)上精算 90%,第二阶段字节是第一阶段的 2.3 倍。
+# 全局 τ:先算出所有向量的上界 ub = est + f_error*g,取第 k 小的作为 τ。若误差界成立,
+# 至少有 k 条的真实距离 <= τ,所以下界 >= τ 的向量不可能进 top-k。FiQA 上精算降到
+# 0.71%(比 FAISS 单线程顺序扫描的 0.79% 还少),召回不变。
+#
+# 设备上分三个 kernel:
+#   bounds  每 task:写出每条的下界 lb;记下本段最小的 k 个 ub
+#   tau     单 task:所有 task 的 k 个 ub 里取第 k 小 -> τ
+#   refine  每 task:只读 lb(4 B/条),lb < min(τ, 本地堆最大值) 才精算
+# ---------------------------------------------------------------------------
+@njit(cache=True)
+def _smallest_k_max(vals, b, e, k, buf):
+    """把 vals[b:e] 中最小的 k 个放进 buf(未满为 inf),返回 buf 的最大值。替换规则同堆。"""
+    for j in range(k):
+        buf[j] = np.inf
+    for i in range(b, e):
+        jmax = 0
+        for j in range(1, k):
+            if buf[j] > buf[jmax]:
+                jmax = j
+        if vals[i] < buf[jmax]:
+            buf[jmax] = vals[i]
+    m = buf[0]
+    for j in range(1, k):
+        if buf[j] > m:
+            m = buf[j]
+    return m
+
+
+@njit(cache=True)
+def _refine_range(lb, full, tau, b, e, k, out_d, out_i):
+    refined = 0
+    for i in range(b, e):
+        hmax = out_d[0]
+        jmax = 0
+        for j in range(1, k):
+            if out_d[j] > hmax:
+                hmax = out_d[j]
+                jmax = j
+        thr = tau if tau < hmax else hmax
+        if lb[i] < thr:
+            refined += 1
+            if full[i] < hmax:
+                out_d[jmax] = full[i]
+                out_i[jmax] = i
+    return refined
+
+
+def bounds(est1, ferr, g):
+    """与 kernel rabitq_bounds 相同的 float32 运算。"""
+    f32 = np.float32
+    e = est1.astype(f32)
+    adj = ferr.astype(f32) * f32(g)
+    return np.maximum(f32(0), e - adj), e + adj
+
+
+def two_stage_global(est1, full, ferr, g, k, task_count):
+    """返回 (每 task 结果, 每 task 精算数, 合并后的全局 top-k, τ)。"""
+    n = est1.shape[0]
+    T = task_count
+    lb, ub = bounds(est1, ferr, g)
+    # tau:每 task 本段最小的 k 个 ub -> 合起来再取最小的 k 个 -> 其最大值
+    per = np.full((T, k), np.inf, np.float32)
+    buf = np.empty(k, np.float32)
+    for t in range(T):
+        b, e = task_range(n, T, t)
+        _smallest_k_max(ub, b, e, k, buf)
+        per[t] = buf
+    flat = per.ravel()
+    tau = np.float32(_smallest_k_max(flat, 0, flat.shape[0], k, np.empty(k, np.float32)))
+    res_d = np.full((T, k), np.inf, np.float32)
+    res_i = np.full((T, k), U32_NONE, np.uint32)
+    refined = np.zeros(T, np.int64)
+    fu = full.astype(np.float32)
+    for t in range(T):
+        b, e = task_range(n, T, t)
+        refined[t] = _refine_range(lb, fu, tau, b, e, k, res_d[t], res_i[t])
+    return res_d, res_i, refined, merge(res_d, res_i, k), tau
 
 
 def merge(res_d, res_i, k):

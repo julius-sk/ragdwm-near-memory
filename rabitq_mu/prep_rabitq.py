@@ -53,8 +53,11 @@ def pack_qblock(qblk, d, words, ex_bits, ex_bytes, k, nbytes):
 
 def load_vectors(a):
     if a.emb:
-        z = np.load(a.emb)
-        return np.ascontiguousarray(z["d"], np.float32), np.ascontiguousarray(z["q"], np.float32)
+        import vecdata
+        docs, qv = vecdata.load(a.emb)
+        dv = vecdata.take(docs, vecdata.subset_ids(docs.shape[0], a.subset, a.subset_seed))
+        qv = qv[vecdata.query_ids(qv.shape[0], a.nq, a.query_seed)]
+        return dv, qv
     n, d = a.synthetic
     rng = np.random.default_rng(a.seed)
     dv = rng.standard_normal((n, d), dtype=np.float32)
@@ -114,6 +117,10 @@ def main():
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--nq", type=int, default=100)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--subset", type=int, default=0,
+                    help="只取 N 条文档(0 = 全部);抽样规则与 scale/scale_kprime.py 相同")
+    ap.add_argument("--subset-seed", type=int, default=0)
+    ap.add_argument("--query-seed", type=int, default=1)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)

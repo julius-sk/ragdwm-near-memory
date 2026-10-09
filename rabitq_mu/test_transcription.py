@@ -123,6 +123,65 @@ def rabitq_merge(res_d, res_i, numTasks, k):
     return bd, bi
 
 
+def keepSmallest(buf, k, v):
+    jmax = 0
+    for j in range(1, k):
+        if buf[j] > buf[jmax]:
+            jmax = j
+    if v < buf[jmax]:
+        buf[jmax] = v
+
+
+def rabitq_bounds_task(signs, fac1, q, numSigs, taskIdx, taskCount, lb_out):
+    k = q["k"]
+    buf = [INF] * k
+    begin, end = myRange(numSigs, taskIdx, taskCount)
+    for i in range(begin, end):
+        dot, pc = stage1Ints(signs[i], q)
+        est = stage1Est(dot, pc, fac1[i], q)
+        adj = f32(fac1[i][2] * q["gError"])
+        lb = f32(est - adj)
+        if lb < f32(0.0):
+            lb = f32(0.0)
+        lb_out[i] = lb
+        keepSmallest(buf, k, f32(est + adj))
+    return buf
+
+
+def rabitq_tau(ub_all, k):
+    buf = [INF] * k
+    for v in ub_all:
+        keepSmallest(buf, k, v)
+    tau = buf[0]
+    for j in range(1, k):
+        if buf[j] > tau:
+            tau = buf[j]
+    return tau
+
+
+def rabitq_refine_task(signs, excode, facx, q, lb, tau, numSigs, taskIdx, taskCount):
+    k = q["k"]
+    hd = [INF] * k
+    hi = [NONE] * k
+    begin, end = myRange(numSigs, taskIdx, taskCount)
+    refined = 0
+    for i in range(begin, end):
+        hmax = hd[0]
+        jmax = 0
+        for j in range(1, k):
+            if hd[j] > hmax:
+                hmax = hd[j]
+                jmax = j
+        thr = tau if tau < hmax else hmax
+        if lb[i] < thr:
+            refined += 1
+            full = stage2Full(signs[i], excode[i], facx[i], q)
+            if full < hmax:
+                hd[jmax] = full
+                hi[jmax] = i
+    return hd, hi, refined
+
+
 def as_query(qblk, s, k):
     return {"d": s["d"], "words": s["W"], "qb": qblk["qb"], "exBits": s["ex_bits"],
             "k": k, "c1": qblk["c1"], "c2": qblk["c2"], "c34": qblk["c34"],
@@ -171,6 +230,26 @@ def main():
                 ti.append(hi)
             bd, bi = rabitq_merge(td, ti, T, K)
             n_task += set(b for b in bi if b != NONE) != set(mi.tolist())
+            # G 模式:bounds -> tau -> refine -> merge
+            if s["ex_bits"]:
+                gd, gi, gref, (gmd, gmi), gtau = R.two_stage_global(
+                    est_r, full_r, s["fac1"][:, 2], qblk["g_error"], K, T)
+                lb_tr = [f32(0)] * n
+                ub_all = []
+                for t in range(T):
+                    ub_all += rabitq_bounds_task(s["signs"], s["fac1"], q, n, t, T, lb_tr)
+                tau = rabitq_tau(ub_all, K)
+                n_g = int(tau != gtau)
+                tdd, tii = [], []
+                for t in range(T):
+                    hd, hi, ref = rabitq_refine_task(s["signs"], s["excode"], s["facx"], q,
+                                                     lb_tr, tau, n, t, T)
+                    n_g += (set(hi) != set(gi[t].tolist())) or (ref != gref[t])
+                    tdd.append(hd)
+                    tii.append(hi)
+                bd, bi = rabitq_merge(tdd, tii, T, K)
+                n_g += set(b for b in bi if b != NONE) != set(gmi.tolist())
+                n_task += n_g
         print("  nb=%d: 整数不一致 %d/%d | est 最大相对误差 %.1e | full 最大相对误差 %s | "
               "task 结果不一致 %d/%d"
               % (nb, n_int, n * nq, e_est, "%.1e" % e_full if s["ex_bits"] else "n/a",

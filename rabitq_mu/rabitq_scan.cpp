@@ -4,8 +4,10 @@
 //   I  只算第一阶段的两个整数(dot, popcount)       —— 验证位运算路径
 //   E  第一阶段 1-bit 距离估计,全部 N 条           —— 验证第一阶段浮点 + 测扫描带宽
 //   F  第二阶段多 bit 完整距离,全部 N 条            —— 验证第二阶段浮点
-//   T  两阶段 top-k:rabitq_topk(每 task)+ rabitq_merge(单 task 归并),只回传 k 个
-// I/E/F 是诊断模式,T 是真正的搜索。排查顺序:I 不对 -> 位运算/布局;I 对 E 不对 ->
+//   T  两阶段 top-k,每 task 各自的堆:rabitq_topk + rabitq_merge
+//   G  两阶段 top-k,全局阈值 τ 两遍:rabitq_bounds + rabitq_tau + rabitq_refine + rabitq_merge
+// I/E/F 是诊断模式,T/G 是搜索,都只回传 k 个 (距离, id)。G 是该用的那个:T 在 2816 个
+// task 下每 task 分到的向量太少,堆填不满,几乎全部被精算(参考模型 FiQA 上 90% vs G 的 0.71%)。排查顺序:I 不对 -> 位运算/布局;I 对 E 不对 ->
 // 第一阶段浮点;E 对 F 不对 -> 第二阶段浮点(DRAN 记录过标量浮点循环在 -O3 下算错)。
 //
 // 内存规则沿用 hamming_scan.cpp:MU 核碰到的一切都在一个 arena 里,preload 一次
@@ -89,11 +91,12 @@ int main(int argc, char* argv[])
         else if (!strcmp(argv[i], "--dump-nq") && i + 1 < argc) dumpNq = (int)nextI(i);
         else { printf("未知参数 %s\n", argv[i]); return 1; }
     }
-    if (!data) { printf("用法: rabitq_scan --data PREFIX [--mode I|E|F|T] [-t 2816] [-b 16] [-s 8] "
+    if (!data) { printf("用法: rabitq_scan --data PREFIX [--mode I|E|F|T|G] [-t 2816] [-b 16] [-s 8] "
                         "[--reps 3] [--nq N] [--dump FILE] [--dump-nq 2]\n"); return 1; }
     const char m = mode[0];
-    if (strlen(mode) != 1 || (m != 'I' && m != 'E' && m != 'F' && m != 'T'))
-    { printf("mode 必须是 I、E、F 或 T\n"); return 1; }
+    if (strlen(mode) != 1 || (m != 'I' && m != 'E' && m != 'F' && m != 'T' && m != 'G'))
+    { printf("mode 必须是 I、E、F、T 或 G\n"); return 1; }
+    const bool topkMode = (m == 'T' || m == 'G');
     if (taskCount <= 0 || reps <= 0) { printf("taskCount、reps 必须 > 0\n"); return 1; }
 
     // ---- 读元数据 ----
@@ -115,7 +118,7 @@ int main(int argc, char* argv[])
     if (nqLimit > 0 && (uint64_t)nqLimit < nq) nq = (uint64_t)nqLimit;
     if (k == 0 || k > K_MAX) { printf("k=%llu 超出 1..%llu\n", (unsigned long long)k,
                                       (unsigned long long)K_MAX); return 1; }
-    if (m == 'F' && exBits == 0) { printf("nb=1 没有第二阶段,F 模式无意义\n"); return 1; }
+    if ((m == 'F' || m == 'G') && exBits == 0) { printf("nb=1 没有第二阶段,F/G 模式无意义\n"); return 1; }
 
     const size_t s1Bytes = words * 8 + 12;            // 第一阶段每向量读的字节
     const size_t s2Bytes = exBytes + 8;               // 第二阶段每向量读的字节
@@ -145,10 +148,14 @@ int main(int argc, char* argv[])
     const size_t offFacx = reserve(N * 8);
     const size_t offQb = reserve(nq * qbBytes);
     const size_t outBytesFull = (m == 'I') ? N * 8 : N * 4;
-    const size_t offOut = (m == 'T') ? 0 : reserve(outBytesFull);
-    const size_t offRes = (m == 'T') ? reserve((size_t)taskCount * k * 8) : 0;
-    const size_t offStats = (m == 'T') ? reserve((size_t)taskCount * 8) : 0;
-    const size_t offFinal = (m == 'T') ? reserve(k * 8) : 0;
+    const size_t offOut = topkMode ? 0 : reserve(outBytesFull);
+    const size_t offRes = topkMode ? reserve((size_t)taskCount * k * 8) : 0;
+    const size_t offStats = topkMode ? reserve((size_t)taskCount * 8) : 0;
+    const size_t offFinal = topkMode ? reserve(k * 8) : 0;
+    // G 模式:每条的下界、每 task 的 k 个上界、全局 τ
+    const size_t offLB = (m == 'G') ? reserve(N * 4) : 0;
+    const size_t offUB = (m == 'G') ? reserve((size_t)taskCount * k * 4) : 0;
+    const size_t offTau = (m == 'G') ? reserve(64) : 0;
     const size_t arenaBytes = alignUpGB(off);
     printf("  arena = %.3f GB used -> %.0f GB preloaded\n", off / 1e9, arenaBytes / 1e9);
 
@@ -159,10 +166,13 @@ int main(int argc, char* argv[])
     auto* excode = reinterpret_cast<uint8_t*>(arena + offEx);
     auto* facx = reinterpret_cast<float*>(arena + offFacx);
     auto* qblocks = arena + offQb;
-    void* out = (m == 'T') ? nullptr : (void*)(arena + offOut);
+    void* out = topkMode ? nullptr : (void*)(arena + offOut);
     auto* res = reinterpret_cast<uint32_t*>(arena + offRes);
     auto* stats = reinterpret_cast<uint32_t*>(arena + offStats);
     auto* fin = reinterpret_cast<uint32_t*>(arena + offFinal);
+    auto* lbArr = reinterpret_cast<float*>(arena + offLB);
+    auto* ubArr = reinterpret_cast<float*>(arena + offUB);
+    auto* tauBuf = reinterpret_cast<float*>(arena + offTau);
 
     // ---- 填数据(全部在 preload 之前)----
     auto tFill = std::chrono::steady_clock::now();
@@ -199,20 +209,33 @@ int main(int argc, char* argv[])
     auto job = numSub > 0 ? context->createJob(numSub) : context->createJob();
     if (job->load(module) != pxl::Result::Success) { printf("job load failed\n"); return 1; }
 
+    // 第一个(或唯一一个)每-task kernel:I/E/F/T 各自的 kernel;G 是 bounds
     const char* fname = (m == 'I') ? "rabitq_ints" : (m == 'E') ? "rabitq_est1"
-                      : (m == 'F') ? "rabitq_full" : "rabitq_topk";
+                      : (m == 'F') ? "rabitq_full" : (m == 'T') ? "rabitq_topk" : "rabitq_bounds";
     auto* func = module->createFunction(fname);
     auto exec = job->buildMap(func, taskCount);
     if (batchSize > 0) exec->setBatchSize(batchSize);
     if (spread) exec->setLocalityMode(pxl::LocalityMode::SpreadMode);
-    auto* mergeFunc = (m == 'T') ? module->createFunction("rabitq_merge") : nullptr;
-    auto mergeExec = (m == 'T') ? job->buildMap(mergeFunc, 1) : nullptr;
+    auto* mergeFunc = topkMode ? module->createFunction("rabitq_merge") : nullptr;
+    auto mergeExec = topkMode ? job->buildMap(mergeFunc, 1) : nullptr;
+    // G 模式另外两个:单 task 求 τ,每 task 精算
+    auto* tauFunc = (m == 'G') ? module->createFunction("rabitq_tau") : nullptr;
+    auto tauExec = (m == 'G') ? job->buildMap(tauFunc, 1) : nullptr;
+    auto* refFunc = (m == 'G') ? module->createFunction("rabitq_refine") : nullptr;
+    auto refExec = (m == 'G') ? job->buildMap(refFunc, taskCount) : nullptr;
+    if (m == 'G')
+    {
+        if (batchSize > 0) refExec->setBatchSize(batchSize);
+        if (spread) refExec->setLocalityMode(pxl::LocalityMode::SpreadMode);
+    }
 
     // 非 const:hamming_scan.cpp 传给 execute 的都是非 const 指针,盲写时不冒类型推导的险
     auto qptr = [&](uint64_t qi) {
         return reinterpret_cast<uint64_t*>(qblocks + qi * qbBytes);
     };
-    // 一次执行;返回是否成功。scanMs/mergeMs 写出各段耗时。
+    // 一次执行;返回是否成功。
+    //   scanMs  :第一个每-task kernel(I/E/F 的全部;T 的扫描+精算;G 的第一遍 bounds)
+    //   mergeMs :其后的全部(T:归并;G:τ + 第二遍精算 + 归并)
     auto runOne = [&](uint64_t qi, double& scanMs, double& mergeMs) -> bool {
         uint64_t* qb = qptr(qi);
         auto t0 = std::chrono::steady_clock::now();
@@ -220,18 +243,26 @@ int main(int argc, char* argv[])
         if (m == 'I') r = exec->execute(signs, qb, N, (uint32_t*)out);
         else if (m == 'E') r = exec->execute(signs, fac1, qb, N, (float*)out);
         else if (m == 'F') r = exec->execute(signs, excode, facx, qb, N, (float*)out);
-        else r = exec->execute(signs, fac1, excode, facx, qb, N, res, stats);
+        else if (m == 'T') r = exec->execute(signs, fac1, excode, facx, qb, N, res, stats);
+        else r = exec->execute(signs, fac1, qb, N, lbArr, ubArr);
         if (r != pxl::Result::Success || exec->synchronize() != pxl::Result::Success) return false;
         scanMs = msSince(t0);
         mergeMs = 0.0;
-        if (m == 'T')
+        if (!topkMode) return true;
+        auto t1 = std::chrono::steady_clock::now();
+        if (m == 'G')
         {
-            auto t1 = std::chrono::steady_clock::now();
-            if (mergeExec->execute(res, (uint64_t)taskCount, k, fin) != pxl::Result::Success ||
-                mergeExec->synchronize() != pxl::Result::Success)
+            if (tauExec->execute(ubArr, (uint64_t)taskCount, k, tauBuf) != pxl::Result::Success ||
+                tauExec->synchronize() != pxl::Result::Success)
                 return false;
-            mergeMs = msSince(t1);
+            if (refExec->execute(signs, excode, facx, qb, lbArr, tauBuf, N, res, stats) != pxl::Result::Success ||
+                refExec->synchronize() != pxl::Result::Success)
+                return false;
         }
+        if (mergeExec->execute(res, (uint64_t)taskCount, k, fin) != pxl::Result::Success ||
+            mergeExec->synchronize() != pxl::Result::Success)
+            return false;
+        mergeMs = msSince(t1);
         return true;
     };
 
@@ -263,7 +294,7 @@ int main(int argc, char* argv[])
         mergeT.push_back(bestMerge);
         totalT.push_back(bestTotal);
 
-        if (m == 'T')
+        if (topkMode)
         {
             pxl::flushHostCache(stats, (size_t)taskCount * 8);
             pxl::flushHostCache(fin, k * 8);
@@ -304,14 +335,17 @@ int main(int argc, char* argv[])
                            : (m == 'F') ? (double)N * (words * 8 + exBytes + 8)
                            : (double)N * s1Bytes;
     printf("\n--- 稳态,每查询(%llu 个查询,每个取 %d 次中的最小值)---\n", (unsigned long long)nq, reps);
-    printf("  扫描 kernel   中位 %.3f ms   最小 %.3f ms\n", medScan, minScan);
+    printf("  %s 中位 %.3f ms   最小 %.3f ms\n",
+           m == 'G' ? "第一遍 bounds" : "扫描 kernel  ", medScan, minScan);
     printf("  扫描读入      %.3f GB  ->  中位有效带宽 %.1f GB/s(上限 268)\n",
            scanBytes / 1e9, scanBytes / 1e9 / (medScan / 1e3));
-    if (m == 'T')
+    if (topkMode)
     {
         const double medRef = median(refinedPerQ);
-        printf("  归并 kernel   中位 %.3f ms\n", median(mergeT));
+        printf("  %s 中位 %.3f ms\n", m == 'G' ? "τ+第二遍+归并" : "归并 kernel  ", median(mergeT));
         printf("  合计          中位 %.3f ms\n", median(totalT));
+        if (m == 'G')
+            printf("  第二遍读入    %.3f GB 下界(4 B/条)+ 被精算向量的符号码与附加码\n", N * 4 / 1e9);
         printf("  精算          中位 %.0f 个/查询 (%.3f%% of N),第二阶段读 %.1f KB/查询\n",
                medRef, 100.0 * medRef / N, medRef * s2Bytes / 1e3);
         printf("  链路回传      %llu B/查询(k 个 (距离, id));设备内实扫 %.3f GB\n",

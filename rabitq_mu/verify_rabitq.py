@@ -6,7 +6,7 @@
   I  整数 (dot, popcount)       必须逐个相等
   E  第一阶段距离               相对误差 < 1e-5(FMA 合并等会造成 ulp 级差异)
   F  第二阶段距离               相对误差 < 1e-4(d 维浮点累加,顺序不同)
-  T  top-k                      id 集合与参考模型(同 task 数)一致;
+  T/G top-k                     id 集合与参考模型(同 task 数、同模式)一致;
                                 另报精算次数差、与 FAISS / 精确 top-k 的召回
 
 用法:
@@ -66,9 +66,13 @@ def simulate(s, qblks, k, mode, dump, tasks, dump_nq, nq):
     with open(dump, "wb") as f:
         for qi in range(nq):
             qblk = qblks[qi]
-            if mode == "T":
+            if mode in "TG":
                 est, full = reference(s, qblk)
-                _, _, refined, (md, mi) = R.two_stage(est, full, s["fac1"][:, 2], qblk["g_error"], k, tasks)
+                if mode == "T":
+                    _, _, refined, (md, mi) = R.two_stage(est, full, s["fac1"][:, 2], qblk["g_error"], k, tasks)
+                else:
+                    _, _, refined, (md, mi), _ = R.two_stage_global(est, full, s["fac1"][:, 2],
+                                                                     qblk["g_error"], k, tasks)
                 for dv, iv in zip(md, mi):
                     f.write(struct.pack("<fI", float(dv), int(iv)))
                 f.write(struct.pack("<QQ", int(refined.sum()), s["N"]))
@@ -118,7 +122,7 @@ def verify(s, qblks, k, mode, dump, tasks, dump_nq, nq, prefix):
         rec = k * 8 + 16
         nd = min(nq, raw.size // rec)
         chk = np.load(prefix + ".check.npz")
-        agree = refined_diff = bad_q = 0
+        agree = refined_diff = bad_q = bad_refine = 0
         rec_exact = rec_faiss = 0.0
         for qi in range(nd):
             r = raw[qi * rec:(qi + 1) * rec]
@@ -127,8 +131,12 @@ def verify(s, qblks, k, mode, dump, tasks, dump_nq, nq, prefix):
             dists = pairs[:, 0].copy().view("<f4").astype(np.float64)
             refined, processed = struct.unpack("<QQ", r[k * 8:].tobytes())
             est, full = reference(s, qblks[qi])
-            _, _, ref_refined, (md, mi) = R.two_stage(est, full, s["fac1"][:, 2],
-                                                      qblks[qi]["g_error"], k, tasks)
+            if mode == "T":
+                _, _, ref_refined, (md, mi) = R.two_stage(est, full, s["fac1"][:, 2],
+                                                          qblks[qi]["g_error"], k, tasks)
+            else:
+                _, _, ref_refined, (md, mi), _ = R.two_stage_global(est, full, s["fac1"][:, 2],
+                                                                     qblks[qi]["g_error"], k, tasks)
             agree += set(ids.tolist()) == set(mi.tolist())
             # 判据不按查询个数容忍,而是逐条核对:
             #  (a) 每个设备 id 在参考模型里的完整距离 == 设备报的距离 —— 编造/错位的 id 过不了
@@ -144,7 +152,13 @@ def verify(s, qblks, k, mode, dump, tasks, dump_nq, nq, prefix):
                 if bad_q <= 3:
                     print("  !! query %d: 距离核对失败 (id 与距离对得上: %s, 距离集合一致: %s)"
                           % (qi, ok_a, ok_b))
-            refined_diff = max(refined_diff, abs(int(refined) - int(ref_refined.sum())))
+            diff = abs(int(refined) - int(ref_refined.sum()))
+            refined_diff = max(refined_diff, diff)
+            # 精算次数是 G 模式要证明的东西,必须核对:只容许 ulp 级翻转(<= 10 次或 1%)
+            if diff > max(10, 0.01 * int(ref_refined.sum())):
+                bad_refine += 1
+                if bad_refine <= 3:
+                    print("  !! query %d: 精算 %d 次,参考模型 %d 次" % (qi, refined, int(ref_refined.sum())))
             if processed != N:
                 print("  !! query %d: 处理数 %d != N %d" % (qi, processed, N))
                 ok = False
@@ -152,11 +166,11 @@ def verify(s, qblks, k, mode, dump, tasks, dump_nq, nq, prefix):
             rec_faiss += len(set(ids.tolist()) & set(chk["faiss_top"][qi].tolist())) / k
         print("  top-%d id 集合与参考模型一致: %d / %d(不一致的必须能由距离打平解释)" % (k, agree, nd))
         print("  距离核对失败的查询: %d / %d" % (bad_q, nd))
-        print("  精算次数与参考模型的最大差: %d(浮点 ulp 差异可让个别候选的判定翻转)" % refined_diff)
+        print("  精算次数与参考模型的最大差: %d;超出容差的查询 %d / %d" % (refined_diff, bad_refine, nd))
         print("  召回 vs 精确 L2 top-%d: %.4f | 与 FAISS top-%d 重合: %.4f"
               % (k, rec_exact / nd, k, rec_faiss / nd))
-        ok &= bad_q == 0
-    print("\n结论:", "设备输出与参考模型一致" if ok else "!! 不一致 —— 按 I -> E -> F -> T 的顺序排查")
+        ok &= bad_q == 0 and bad_refine == 0
+    print("\n结论:", "设备输出与参考模型一致" if ok else "!! 不一致 —— 按 I -> E -> F -> T/G 的顺序排查")
     return 0 if ok else 1
 
 
@@ -164,8 +178,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     g = ap.add_mutually_exclusive_group(required=True)
-    g.add_argument("--mode", choices=list("IEFT"))
-    g.add_argument("--simulate", choices=list("IEFT"))
+    g.add_argument("--mode", choices=list("IEFTG"))
+    g.add_argument("--simulate", choices=list("IEFTG"))
     ap.add_argument("--dump", required=True)
     ap.add_argument("--tasks", type=int, default=2816)
     ap.add_argument("--dump-nq", type=int, default=2)
