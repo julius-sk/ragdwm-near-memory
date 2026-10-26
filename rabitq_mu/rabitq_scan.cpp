@@ -196,7 +196,13 @@ int main(int argc, char* argv[])
     pxl::flushHostCache(arena, arenaBytes);
     const double flushMs = msSince(tFlush);
     auto tPre = std::chrono::steady_clock::now();
-    if (pxl::preloadMemory(arena, arenaBytes) != pxl::MemoryStatus::Success)
+    // 没有 SSD 层(InfiniteMemory)的卡:DRAM 直接映射,MU 能看到全部,preload 返回
+    // NotSupported 且不需要(gnr1 那张卡就是这样,见 dran_retrieve.cpp 的同样处理)。
+    const pxl::MemoryStatus preSt = pxl::preloadMemory(arena, arenaBytes);
+    const bool plainDram = preSt == pxl::MemoryStatus::NotSupported;
+    if (plainDram)
+        printf("  preload: NotSupported -> 卡没有 SSD 层,DRAM 直接映射,跳过 preload\n");
+    else if (preSt != pxl::MemoryStatus::Success)
     {
         printf("preloadMemory failed —— 设备在 Computing 模式吗?1 GB 槽位够吗?\n");
         pxl::releaseMemory(arena);
@@ -357,7 +363,7 @@ int main(int argc, char* argv[])
     printf("\n--- 一次性初始化 ---\n  flushHostCache %.1f ms, preloadMemory %.1f ms\n", flushMs, preMs);
     if (dump) printf("\n  输出已写出 -> %s(用 verify_rabitq.py 校验)\n", dump);
 
-    if (pxl::unloadMemory(arena, arenaBytes) != pxl::MemoryStatus::Success)
+    if (!plainDram && pxl::unloadMemory(arena, arenaBytes) != pxl::MemoryStatus::Success)
         printf("warning: unloadMemory failed\n");
     pxl::releaseMemory(arena);
     context->destroyJob(job);

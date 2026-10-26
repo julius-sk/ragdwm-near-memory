@@ -68,6 +68,14 @@ int main(int argc, char* argv[])
         void* p = pxl::allocateMemory(deviceId, GB);
         if (!p) { printf("  第 %d 个 1 GB allocateMemory 失败\n", i + 1); break; }
         last = pxl::preloadMemory(p, GB);
+        if (last == pxl::MemoryStatus::NotSupported)
+        {
+            pxl::releaseMemory(p);
+            printf("preload 返回 NotSupported:这张卡没有 SSD 层(InfiniteMemory),DRAM 直接映射,\n"
+                   "MU 能访问全部卡上 DRAM。可用容量 = daxctl list 里该设备的 size。\n");
+            pxl::destroyContext(context);
+            return 0;
+        }
         if (last != pxl::MemoryStatus::Success)
         {
             pxl::releaseMemory(p);
