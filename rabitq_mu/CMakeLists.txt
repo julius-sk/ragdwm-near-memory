@@ -19,6 +19,12 @@ target_include_directories(rabitq_scan PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rabitq_scan ${shared_libs})
 install(TARGETS rabitq_scan RUNTIME DESTINATION ${CMAKE_CURRENT_SOURCE_DIR})
 
+# bench/:Preload Region 容量探测(只链接 PXL,没有 kernel)
+add_executable(preload_probe bench/preload_probe.cpp)
+target_compile_features(preload_probe PRIVATE cxx_std_17)
+target_link_libraries(preload_probe ${shared_libs})
+install(TARGETS preload_probe RUNTIME DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+
 include(ExternalProject)
 ExternalProject_Add(build_mu_${PROJECT_NAME}
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/mu_kernel

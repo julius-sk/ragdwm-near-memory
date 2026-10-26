@@ -30,7 +30,7 @@ namespace
 {
 constexpr uint32_t K_MAX = 64;
 constexpr uint32_t QB_MAX = 8;
-constexpr uint32_t WORDS_MAX = 32;            // d <= 2048
+constexpr uint32_t WORDS_MAX = 48;            // d <= 3072(OpenAI text-embedding-3-large)
 constexpr uint32_t NONE = 0xFFFFFFFFu;
 
 // 布局必须与 prep_rabitq.py 的 QHEADER 完全一致。
